@@ -2,6 +2,52 @@ import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
+import { spawn, type ChildProcess } from "child_process";
+
+let pythonProcess: ChildProcess | null = null;
+
+function startPythonAPI(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    pythonProcess = spawn("python", ["api/main.py"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
+
+    pythonProcess.stdout?.on("data", (data) => {
+      const output = data.toString();
+      console.log(`[python] ${output.trim()}`);
+      if (output.includes("Uvicorn running")) {
+        resolve();
+      }
+    });
+
+    pythonProcess.stderr?.on("data", (data) => {
+      console.error(`[python] ${data.toString().trim()}`);
+    });
+
+    pythonProcess.on("error", (err) => {
+      console.error(`[python] Failed to start: ${err.message}`);
+      reject(err);
+    });
+
+    pythonProcess.on("close", (code) => {
+      console.log(`[python] Process exited with code ${code}`);
+      pythonProcess = null;
+    });
+
+    setTimeout(() => resolve(), 5000);
+  });
+}
+
+process.on("SIGTERM", () => {
+  if (pythonProcess) pythonProcess.kill();
+  process.exit(0);
+});
+
+process.on("SIGINT", () => {
+  if (pythonProcess) pythonProcess.kill();
+  process.exit(0);
+});
 
 const app = express();
 const httpServer = createServer(app);
@@ -60,6 +106,10 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  log("Starting Python API...");
+  await startPythonAPI();
+  log("Python API started");
+  
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
