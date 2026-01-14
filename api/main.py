@@ -2,10 +2,14 @@ import os
 import time
 import asyncio
 import json
+import io
+import base64
+import tempfile
 from datetime import datetime, timedelta
 from typing import Optional
+import threading
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from livekit import api
 from dotenv import load_dotenv
@@ -26,16 +30,40 @@ LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 LIVEKIT_URL = os.getenv("LIVEKIT_URL")
 
+whisper_model = None
+whisper_lock = threading.Lock()
+
+def load_whisper_model():
+    global whisper_model
+    try:
+        from faster_whisper import WhisperModel
+        print("Loading faster-whisper model (tiny)...")
+        whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        print("Whisper model loaded successfully!")
+        return True
+    except Exception as e:
+        print(f"Failed to load Whisper model: {e}")
+        return False
+
+@app.on_event("startup")
+async def startup_event():
+    threading.Thread(target=load_whisper_model, daemon=True).start()
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "whisper_loaded": whisper_model is not None
+    }
 
 @app.get("/api/health")
 async def health_check_with_prefix():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "whisper_loaded": whisper_model is not None
+    }
 
 @app.post("/livekit/token")
 async def generate_token():
@@ -69,6 +97,46 @@ async def generate_token():
     }
 
 
+def transcribe_audio(audio_data: bytes) -> dict:
+    global whisper_model
+    if whisper_model is None:
+        return {"text": "", "error": "Whisper model not loaded"}
+    
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp_file:
+            tmp_file.write(audio_data)
+            tmp_file.flush()
+            
+            with whisper_lock:
+                segments, info = whisper_model.transcribe(
+                    tmp_file.name,
+                    beam_size=1,
+                    language="en",
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500)
+                )
+                
+                text_segments = []
+                for segment in segments:
+                    text_segments.append({
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": segment.text.strip(),
+                    })
+                
+                full_text = " ".join([s["text"] for s in text_segments])
+                
+                return {
+                    "text": full_text,
+                    "segments": text_segments,
+                    "language": info.language,
+                    "language_probability": info.language_probability
+                }
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        return {"text": "", "error": str(e)}
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -87,7 +155,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-SAMPLE_PHRASES = [
+DEMO_PHRASES = [
     "Hello, this is a test of the voice transcription system.",
     "The quick brown fox jumps over the lazy dog.",
     "Real-time speech recognition is an exciting technology.",
@@ -105,56 +173,115 @@ async def websocket_endpoint(websocket: WebSocket):
     
     segment_counter = 0
     session_start = time.time()
-    simulation_task: Optional[asyncio.Task] = None
+    demo_mode = whisper_model is None
+    demo_task: Optional[asyncio.Task] = None
+    
+    await manager.send_transcript(websocket, {
+        "type": "status",
+        "whisper_ready": whisper_model is not None,
+        "mode": "demo" if demo_mode else "live"
+    })
     
     try:
-        async def send_simulated_transcripts():
-            nonlocal segment_counter
-            while True:
-                await asyncio.sleep(3)
-                segment_counter += 1
-                phrase = SAMPLE_PHRASES[segment_counter % len(SAMPLE_PHRASES)]
-                
-                transcript_data = {
-                    "type": "transcript",
-                    "id": f"segment-{segment_counter}",
-                    "timestamp": int((time.time() - session_start) * 1000),
-                    "text": phrase,
-                    "confidence": 0.85 + (segment_counter % 15) / 100,
-                    "speaker": "Speaker 1",
-                    "isFinal": True,
-                }
-                
-                await manager.send_transcript(websocket, transcript_data)
-        
-        simulation_task = asyncio.create_task(send_simulated_transcripts())
-        
-        while True:
-            data = await websocket.receive_text()
-            try:
-                message = json.loads(data)
-                print(f"Received message: {message}")
-                
-                if message.get("type") == "audio":
+        if demo_mode:
+            async def send_demo_transcripts():
+                nonlocal segment_counter
+                while True:
+                    await asyncio.sleep(3)
                     segment_counter += 1
+                    phrase = DEMO_PHRASES[segment_counter % len(DEMO_PHRASES)]
+                    
                     await manager.send_transcript(websocket, {
                         "type": "transcript",
                         "id": f"segment-{segment_counter}",
                         "timestamp": int((time.time() - session_start) * 1000),
-                        "text": "Processing audio...",
-                        "isFinal": False,
+                        "text": phrase,
+                        "confidence": 0.85 + (segment_counter % 15) / 100,
+                        "speaker": "Speaker 1",
+                        "isFinal": True,
+                        "mode": "demo"
                     })
-            except json.JSONDecodeError:
-                print("Failed to parse WebSocket message")
+            
+            demo_task = asyncio.create_task(send_demo_transcripts())
+        
+        while True:
+            data = await websocket.receive()
+            
+            if "bytes" in data:
+                audio_bytes = data["bytes"]
+                segment_counter += 1
                 
+                await manager.send_transcript(websocket, {
+                    "type": "transcript",
+                    "id": f"segment-{segment_counter}",
+                    "timestamp": int((time.time() - session_start) * 1000),
+                    "text": "Transcribing...",
+                    "isFinal": False,
+                })
+                
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(None, transcribe_audio, audio_bytes)
+                
+                if result.get("text"):
+                    await manager.send_transcript(websocket, {
+                        "type": "transcript",
+                        "id": f"segment-{segment_counter}",
+                        "timestamp": int((time.time() - session_start) * 1000),
+                        "text": result["text"],
+                        "confidence": result.get("language_probability", 0.9),
+                        "speaker": "Speaker 1",
+                        "isFinal": True,
+                        "mode": "live"
+                    })
+            
+            elif "text" in data:
+                try:
+                    message = json.loads(data["text"])
+                    print(f"Received message: {message}")
+                    
+                    if message.get("type") == "audio_chunk" and "data" in message:
+                        audio_data = base64.b64decode(message["data"])
+                        segment_counter += 1
+                        
+                        loop = asyncio.get_event_loop()
+                        result = await loop.run_in_executor(None, transcribe_audio, audio_data)
+                        
+                        if result.get("text"):
+                            await manager.send_transcript(websocket, {
+                                "type": "transcript",
+                                "id": f"segment-{segment_counter}",
+                                "timestamp": int((time.time() - session_start) * 1000),
+                                "text": result["text"],
+                                "confidence": result.get("language_probability", 0.9),
+                                "speaker": "Speaker 1",
+                                "isFinal": True,
+                                "mode": "live"
+                            })
+                    
+                    elif message.get("type") == "ping":
+                        await manager.send_transcript(websocket, {"type": "pong"})
+                        
+                except json.JSONDecodeError:
+                    print("Failed to parse WebSocket message")
+                    
     except WebSocketDisconnect:
         print("WebSocket client disconnected")
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
-        if simulation_task:
-            simulation_task.cancel()
+        if demo_task:
+            demo_task.cancel()
         manager.disconnect(websocket)
+
+
+@app.post("/transcribe")
+async def transcribe_file(file: UploadFile = File(...)):
+    if whisper_model is None:
+        return {"error": "Whisper model not loaded yet, please wait..."}
+    
+    audio_data = await file.read()
+    result = transcribe_audio(audio_data)
+    return result
 
 
 if __name__ == "__main__":
