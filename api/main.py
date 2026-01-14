@@ -65,13 +65,20 @@ async def health_check_with_prefix():
         "whisper_loaded": whisper_model is not None
     }
 
-@app.post("/livekit/token")
-async def generate_token():
+from pydantic import BaseModel
+
+class TokenRequest(BaseModel):
+    roomName: Optional[str] = None
+    identity: Optional[str] = None
+
+@app.post("/api/livekit/token")
+async def generate_token(request: TokenRequest = None):
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         return {"error": "LiveKit not configured"}, 500
     
-    room_name = f"transcription-{int(time.time() * 1000)}"
-    identity = f"user-{int(time.time() * 1000)}"
+    # Use provided values or defaults
+    room_name = request.roomName if request and request.roomName else f"transcription-{int(time.time() * 1000)}"
+    identity = request.identity if request and request.identity else f"user-{int(time.time() * 1000)}"
     
     token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
         .with_identity(identity) \
