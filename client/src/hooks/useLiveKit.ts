@@ -2,7 +2,6 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import {
   Room,
   RoomEvent,
-  Track,
   createLocalAudioTrack,
   LocalAudioTrack,
 } from "livekit-client";
@@ -18,6 +17,7 @@ interface UseLiveKitReturn {
   stopRecording: () => void;
   roomName: string | null;
   error: string | null;
+  mode: "live" | "demo" | null;
 }
 
 export function useLiveKit(): UseLiveKitReturn {
@@ -27,11 +27,13 @@ export function useLiveKit(): UseLiveKitReturn {
   const [audioLevel, setAudioLevel] = useState(0);
   const [roomName, setRoomName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [mode, setMode] = useState<"live" | "demo" | null>(null);
   
   const roomRef = useRef<Room | null>(null);
   const audioTrackRef = useRef<LocalAudioTrack | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const sessionStartRef = useRef<number>(0);
+  const isStoppingRef = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -44,70 +46,87 @@ export function useLiveKit(): UseLiveKitReturn {
     };
   }, []);
 
-  const connectWebSocket = useCallback(() => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+  const connectWebSocket = useCallback((): Promise<WebSocket> => {
+    return new Promise((resolve, reject) => {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
-    ws.onopen = () => {
-      console.log("WebSocket connected for transcription");
-    };
+      ws.onopen = () => {
+        console.log("WebSocket connected for transcription");
+        resolve(ws);
+      };
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === "transcript") {
-          const segment: TranscriptSegment = {
-            id: data.id || crypto.randomUUID(),
-            timestamp: data.timestamp || Date.now() - sessionStartRef.current,
-            text: data.text,
-            confidence: data.confidence,
-            speaker: data.speaker,
-            isFinal: data.isFinal ?? true,
-          };
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
           
-          setSegments((prev) => {
-            if (!segment.isFinal) {
-              const existingIndex = prev.findIndex((s) => !s.isFinal);
-              if (existingIndex >= 0) {
-                const updated = [...prev];
-                updated[existingIndex] = segment;
-                return updated;
+          if (data.type === "status") {
+            console.log("Server status:", data);
+            setMode(data.mode === "demo" ? "demo" : "live");
+          }
+          
+          if (data.type === "transcript") {
+            const segment: TranscriptSegment = {
+              id: data.id || crypto.randomUUID(),
+              timestamp: data.timestamp || Date.now() - sessionStartRef.current,
+              text: data.text,
+              confidence: data.confidence,
+              speaker: data.speaker,
+              isFinal: data.isFinal ?? true,
+            };
+            
+            setSegments((prev) => {
+              if (!segment.isFinal) {
+                const existingIndex = prev.findIndex((s) => !s.isFinal);
+                if (existingIndex >= 0) {
+                  const updated = [...prev];
+                  updated[existingIndex] = segment;
+                  return updated;
+                }
+                return [...prev, segment];
               }
-              return [...prev, segment];
-            }
-            const filtered = prev.filter((s) => s.isFinal);
-            return [...filtered, segment];
-          });
+              const filtered = prev.filter((s) => s.isFinal);
+              return [...filtered, segment];
+            });
+          }
+        } catch (e) {
+          console.error("Failed to parse WebSocket message:", e);
         }
-      } catch (e) {
-        console.error("Failed to parse WebSocket message:", e);
-      }
-    };
+      };
 
-    ws.onerror = (e) => {
-      console.error("WebSocket error:", e);
-    };
+      ws.onerror = (e) => {
+        console.error("WebSocket error:", e);
+        if (ws.readyState !== WebSocket.OPEN) {
+          reject(e);
+        }
+      };
 
-    ws.onclose = () => {
-      console.log("WebSocket closed");
-    };
+      ws.onclose = () => {
+        console.log("WebSocket closed");
+        if (!isStoppingRef.current && isRecording) {
+          setStatus("disconnected");
+          setIsRecording(false);
+        }
+      };
 
-    wsRef.current = ws;
-    return ws;
-  }, []);
+      wsRef.current = ws;
+    });
+  }, [isRecording]);
 
   const startRecording = useCallback(async () => {
     try {
+      isStoppingRef.current = false;
       setError(null);
       setStatus("connecting");
       setSegments([]);
+      setMode(null);
 
       const response = await apiRequest("POST", "/api/livekit/token");
       const tokenResponse = await response.json();
       const { token, roomName: room } = tokenResponse;
       setRoomName(room);
 
-      let microphoneAvailable = true;
+      let liveKitConnected = false;
       
       try {
         const liveKitRoom = new Room({
@@ -120,17 +139,13 @@ export function useLiveKit(): UseLiveKitReturn {
 
         roomRef.current = liveKitRoom;
 
-        liveKitRoom.on(RoomEvent.Disconnected, () => {
-          setStatus("disconnected");
-          setIsRecording(false);
-        });
-
         liveKitRoom.on(RoomEvent.ConnectionStateChanged, (state) => {
           console.log("Connection state:", state);
         });
 
         const wsUrl = import.meta.env.VITE_LIVEKIT_URL || "wss://kimo-zg71lj4i.livekit.cloud";
         await liveKitRoom.connect(wsUrl, token);
+        liveKitConnected = true;
 
         const audioTrack = await createLocalAudioTrack({
           echoCancellation: true,
@@ -152,20 +167,26 @@ export function useLiveKit(): UseLiveKitReturn {
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
         
         const updateLevel = () => {
-          if (roomRef.current === null) return;
-          analyser.getByteFrequencyData(dataArray);
-          const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-          setAudioLevel(average / 255);
-          requestAnimationFrame(updateLevel);
+          if (!isStoppingRef.current && roomRef.current) {
+            analyser.getByteFrequencyData(dataArray);
+            const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+            setAudioLevel(average / 255);
+            requestAnimationFrame(updateLevel);
+          }
         };
 
         requestAnimationFrame(updateLevel);
+        setMode("live");
       } catch (micError) {
-        console.warn("Microphone not available, running in demo mode:", micError);
-        microphoneAvailable = false;
+        console.warn("Microphone/LiveKit not available, running in demo mode:", micError);
+        setMode("demo");
+        if (roomRef.current) {
+          roomRef.current.disconnect();
+          roomRef.current = null;
+        }
       }
 
-      connectWebSocket();
+      await connectWebSocket();
       sessionStartRef.current = Date.now();
       setStatus("connected");
       setIsRecording(true);
@@ -179,6 +200,8 @@ export function useLiveKit(): UseLiveKitReturn {
   }, [connectWebSocket]);
 
   const stopRecording = useCallback(() => {
+    isStoppingRef.current = true;
+    
     if (audioTrackRef.current) {
       audioTrackRef.current.stop();
       audioTrackRef.current = null;
@@ -197,6 +220,7 @@ export function useLiveKit(): UseLiveKitReturn {
     setStatus("disconnected");
     setIsRecording(false);
     setAudioLevel(0);
+    setMode(null);
   }, []);
 
   return {
@@ -208,5 +232,6 @@ export function useLiveKit(): UseLiveKitReturn {
     stopRecording,
     roomName,
     error,
+    mode,
   };
 }

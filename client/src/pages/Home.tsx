@@ -22,12 +22,13 @@ export default function Home() {
     stopRecording,
     roomName,
     error,
+    mode,
   } = useLiveKit();
 
   const [sessionStart, setSessionStart] = useState<number | null>(null);
   const [prevStatus, setPrevStatus] = useState(status);
 
-  const { data: healthData, isError: healthError } = useQuery<{ status: string; timestamp: string }>({
+  const { data: healthData, isError: healthError } = useQuery<{ status: string; timestamp: string; whisper_loaded: boolean }>({
     queryKey: ["/api/health"],
     refetchInterval: 30000,
   });
@@ -36,11 +37,13 @@ export default function Home() {
     if (healthData?.status === "ok") {
       toast({
         title: "Backend Connected",
-        description: "Python API is running and healthy",
+        description: healthData.whisper_loaded 
+          ? "Python API + Whisper ready for transcription" 
+          : "Python API ready (Whisper loading...)",
         duration: 3000,
       });
     }
-  }, [healthData?.status]);
+  }, [healthData?.status, healthData?.whisper_loaded]);
 
   useEffect(() => {
     if (healthError) {
@@ -103,7 +106,9 @@ export default function Home() {
             {healthData?.status === "ok" ? (
               <>
                 <CheckCircle className="h-3.5 w-3.5 text-green-500" />
-                <span className="text-muted-foreground">API OK</span>
+                <span className="text-muted-foreground">
+                  API OK {healthData.whisper_loaded ? "| Whisper Ready" : "| Loading Whisper..."}
+                </span>
               </>
             ) : healthError ? (
               <>
@@ -117,6 +122,16 @@ export default function Home() {
               </>
             )}
           </div>
+          {mode && (
+            <div 
+              className={`flex items-center gap-1.5 text-xs px-2 py-1 rounded ${
+                mode === "live" ? "bg-green-500/10 text-green-600" : "bg-yellow-500/10 text-yellow-600"
+              }`}
+              data-testid="status-mode"
+            >
+              {mode === "live" ? "Live Transcription" : "Demo Mode"}
+            </div>
+          )}
           <Button
             size="icon"
             variant="ghost"
