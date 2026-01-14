@@ -124,12 +124,10 @@ export default function Home() {
           </div>
           {mode && (
             <div 
-              className={`flex items-center gap-1.5 text-xs px-2 py-1 rounded ${
-                mode === "live" ? "bg-green-500/10 text-green-600" : "bg-yellow-500/10 text-yellow-600"
-              }`}
+              className="flex items-center gap-1.5 text-xs px-2 py-1 rounded bg-green-500/10 text-green-600"
               data-testid="status-mode"
             >
-              {mode === "live" ? "Live Transcription" : "Demo Mode"}
+              Live Transcription
             </div>
           )}
           <Button

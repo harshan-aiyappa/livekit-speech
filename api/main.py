@@ -155,16 +155,6 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-DEMO_PHRASES = [
-    "Hello, this is a test of the voice transcription system.",
-    "The quick brown fox jumps over the lazy dog.",
-    "Real-time speech recognition is an exciting technology.",
-    "LiveKit provides excellent WebRTC infrastructure for audio streaming.",
-    "This is a demonstration of the transcription capabilities.",
-    "FastAPI powers our Python backend for token generation.",
-    "The frontend connects via WebSocket for real-time updates.",
-]
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -173,43 +163,21 @@ async def websocket_endpoint(websocket: WebSocket):
     
     segment_counter = 0
     session_start = time.time()
-    demo_mode = whisper_model is None
-    demo_task: Optional[asyncio.Task] = None
     
     await manager.send_transcript(websocket, {
         "type": "status",
         "whisper_ready": whisper_model is not None,
-        "mode": "demo" if demo_mode else "live"
+        "mode": "live"
     })
     
     try:
-        if demo_mode:
-            async def send_demo_transcripts():
-                nonlocal segment_counter
-                while True:
-                    await asyncio.sleep(3)
-                    segment_counter += 1
-                    phrase = DEMO_PHRASES[segment_counter % len(DEMO_PHRASES)]
-                    
-                    await manager.send_transcript(websocket, {
-                        "type": "transcript",
-                        "id": f"segment-{segment_counter}",
-                        "timestamp": int((time.time() - session_start) * 1000),
-                        "text": phrase,
-                        "confidence": 0.85 + (segment_counter % 15) / 100,
-                        "speaker": "Speaker 1",
-                        "isFinal": True,
-                        "mode": "demo"
-                    })
-            
-            demo_task = asyncio.create_task(send_demo_transcripts())
-        
         while True:
             data = await websocket.receive()
             
             if "bytes" in data:
                 audio_bytes = data["bytes"]
                 segment_counter += 1
+                print(f"Received audio chunk: {len(audio_bytes)} bytes")
                 
                 await manager.send_transcript(websocket, {
                     "type": "transcript",
@@ -233,6 +201,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         "isFinal": True,
                         "mode": "live"
                     })
+                elif result.get("error"):
+                    print(f"Transcription failed: {result['error']}")
             
             elif "text" in data:
                 try:
@@ -242,6 +212,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if message.get("type") == "audio_chunk" and "data" in message:
                         audio_data = base64.b64decode(message["data"])
                         segment_counter += 1
+                        print(f"Received base64 audio: {len(audio_data)} bytes")
                         
                         loop = asyncio.get_event_loop()
                         result = await loop.run_in_executor(None, transcribe_audio, audio_data)
@@ -269,8 +240,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
-        if demo_task:
-            demo_task.cancel()
         manager.disconnect(websocket)
 
 

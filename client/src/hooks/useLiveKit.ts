@@ -17,7 +17,7 @@ interface UseLiveKitReturn {
   stopRecording: () => void;
   roomName: string | null;
   error: string | null;
-  mode: "live" | "demo" | null;
+  mode: "live" | null;
 }
 
 export function useLiveKit(): UseLiveKitReturn {
@@ -27,17 +27,21 @@ export function useLiveKit(): UseLiveKitReturn {
   const [audioLevel, setAudioLevel] = useState(0);
   const [roomName, setRoomName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [mode, setMode] = useState<"live" | "demo" | null>(null);
+  const [mode, setMode] = useState<"live" | null>(null);
   
   const roomRef = useRef<Room | null>(null);
   const audioTrackRef = useRef<LocalAudioTrack | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const sessionStartRef = useRef<number>(0);
   const isActiveRef = useRef(false);
 
   useEffect(() => {
     return () => {
       isActiveRef.current = false;
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
       if (roomRef.current) {
         roomRef.current.disconnect();
       }
@@ -60,63 +64,52 @@ export function useLiveKit(): UseLiveKitReturn {
       const { token, roomName: room } = tokenResponse;
       setRoomName(room);
 
-      let useLiveMode = false;
-      
-      try {
-        const liveKitRoom = new Room({
-          audioCaptureDefaults: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-
-        roomRef.current = liveKitRoom;
-
-        liveKitRoom.on(RoomEvent.ConnectionStateChanged, (state) => {
-          console.log("LiveKit connection state:", state);
-        });
-
-        const wsUrl = import.meta.env.VITE_LIVEKIT_URL || "wss://kimo-zg71lj4i.livekit.cloud";
-        await liveKitRoom.connect(wsUrl, token);
-        console.log("LiveKit room connected");
-
-        const audioTrack = await createLocalAudioTrack({
+      const liveKitRoom = new Room({
+        audioCaptureDefaults: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-        });
+        },
+      });
 
-        audioTrackRef.current = audioTrack;
-        await liveKitRoom.localParticipant.publishTrack(audioTrack);
-        console.log("Audio track published");
+      roomRef.current = liveKitRoom;
 
-        const audioContext = new AudioContext();
-        const mediaStream = new MediaStream([audioTrack.mediaStreamTrack]);
-        const source = audioContext.createMediaStreamSource(mediaStream);
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        source.connect(analyser);
+      liveKitRoom.on(RoomEvent.ConnectionStateChanged, (state) => {
+        console.log("LiveKit connection state:", state);
+      });
 
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        
-        const updateLevel = () => {
-          if (!isActiveRef.current) return;
-          analyser.getByteFrequencyData(dataArray);
-          const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-          setAudioLevel(average / 255);
-          requestAnimationFrame(updateLevel);
-        };
+      const wsUrl = import.meta.env.VITE_LIVEKIT_URL || "wss://kimo-zg71lj4i.livekit.cloud";
+      await liveKitRoom.connect(wsUrl, token);
+      console.log("LiveKit room connected");
 
+      const audioTrack = await createLocalAudioTrack({
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      });
+
+      audioTrackRef.current = audioTrack;
+      await liveKitRoom.localParticipant.publishTrack(audioTrack);
+      console.log("Audio track published");
+
+      const audioContext = new AudioContext();
+      const mediaStream = new MediaStream([audioTrack.mediaStreamTrack]);
+      const source = audioContext.createMediaStreamSource(mediaStream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      
+      const updateLevel = () => {
+        if (!isActiveRef.current) return;
+        analyser.getByteFrequencyData(dataArray);
+        const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+        setAudioLevel(average / 255);
         requestAnimationFrame(updateLevel);
-        useLiveMode = true;
-      } catch (micError) {
-        console.warn("Microphone/LiveKit not available, using demo mode:", micError);
-        if (roomRef.current) {
-          roomRef.current.disconnect();
-          roomRef.current = null;
-        }
-      }
+      };
+
+      requestAnimationFrame(updateLevel);
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
@@ -124,6 +117,29 @@ export function useLiveKit(): UseLiveKitReturn {
 
       ws.onopen = () => {
         console.log("Transcription WebSocket connected");
+        
+        const mediaRecorder = new MediaRecorder(mediaStream, {
+          mimeType: "audio/webm;codecs=opus",
+        });
+        mediaRecorderRef.current = mediaRecorder;
+
+        mediaRecorder.ondataavailable = async (event) => {
+          if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+            const arrayBuffer = await event.data.arrayBuffer();
+            const bytes = new Uint8Array(arrayBuffer);
+            const binary = Array.from(bytes).map(b => String.fromCharCode(b)).join('');
+            const base64 = btoa(binary);
+            ws.send(JSON.stringify({
+              type: "audio_chunk",
+              data: base64,
+              timestamp: Date.now() - sessionStartRef.current,
+            }));
+            console.log(`Sent audio chunk: ${event.data.size} bytes`);
+          }
+        };
+
+        mediaRecorder.start(3000);
+        console.log("MediaRecorder started - sending audio every 3 seconds");
       };
 
       ws.onmessage = (event) => {
@@ -132,8 +148,8 @@ export function useLiveKit(): UseLiveKitReturn {
           console.log("WebSocket message:", data.type);
           
           if (data.type === "status") {
-            console.log("Server mode:", data.mode, "Whisper ready:", data.whisper_ready);
-            setMode(data.mode === "demo" ? "demo" : useLiveMode ? "live" : "demo");
+            console.log("Server status - Whisper ready:", data.whisper_ready, "Mode:", data.mode);
+            setMode("live");
           }
           
           if (data.type === "transcript" && data.text) {
@@ -171,21 +187,19 @@ export function useLiveKit(): UseLiveKitReturn {
 
       ws.onclose = (e) => {
         console.log("WebSocket closed, code:", e.code, "reason:", e.reason);
-        if (isActiveRef.current) {
-          setStatus("disconnected");
-          setIsRecording(false);
-          isActiveRef.current = false;
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
         }
       };
 
       sessionStartRef.current = Date.now();
-      setMode(useLiveMode ? "live" : "demo");
+      setMode("live");
       setStatus("connected");
       setIsRecording(true);
 
     } catch (err) {
       console.error("Failed to start recording:", err);
-      setError(err instanceof Error ? err.message : "Failed to start recording");
+      setError(err instanceof Error ? err.message : "Failed to start recording. Please allow microphone access.");
       setStatus("error");
       setIsRecording(false);
       isActiveRef.current = false;
@@ -195,6 +209,11 @@ export function useLiveKit(): UseLiveKitReturn {
   const stopRecording = useCallback(() => {
     isActiveRef.current = false;
     
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current = null;
+    }
+
     if (audioTrackRef.current) {
       audioTrackRef.current.stop();
       audioTrackRef.current = null;
