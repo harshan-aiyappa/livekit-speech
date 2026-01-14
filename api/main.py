@@ -71,7 +71,7 @@ class TokenRequest(BaseModel):
     roomName: Optional[str] = None
     identity: Optional[str] = None
 
-@app.post("/api/livekit/token")
+@app.post("/livekit/token")
 async def generate_token(request: TokenRequest = None):
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         return {"error": "LiveKit not configured"}, 500
