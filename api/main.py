@@ -27,12 +27,17 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 LIVEKIT_URL = os.getenv("LIVEKIT_URL")
 
 
-@app.get("/api/health")
+@app.get("/health")
 async def health_check():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
-@app.post("/api/livekit/token")
+@app.get("/api/health")
+async def health_check_with_prefix():
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+
+@app.post("/livekit/token")
 async def generate_token():
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         return {"error": "LiveKit not configured"}, 500
