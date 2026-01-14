@@ -110,13 +110,16 @@ def transcribe_audio(audio_data: bytes) -> dict:
         return {"text": "", "error": "Whisper model not loaded"}
     
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp_file:
+        # Use delete=False because on Windows we can't open the file again while it's open
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
             tmp_file.write(audio_data)
             tmp_file.flush()
+            tmp_filename = tmp_file.name
             
+        try:
             with whisper_lock:
                 segments, info = whisper_model.transcribe(
-                    tmp_file.name,
+                    tmp_filename,
                     beam_size=1,
                     language="en",
                     vad_filter=True,
@@ -139,6 +142,14 @@ def transcribe_audio(audio_data: bytes) -> dict:
                     "language": info.language,
                     "language_probability": info.language_probability
                 }
+        finally:
+            # Clean up the temp file
+            if os.path.exists(tmp_filename):
+                try:
+                    os.remove(tmp_filename)
+                except Exception as e:
+                    print(f"Failed to delete temp file: {e}")
+
     except Exception as e:
         print(f"Transcription error: {e}")
         return {"text": "", "error": str(e)}
