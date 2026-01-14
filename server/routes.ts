@@ -24,19 +24,26 @@ export async function registerRoutes(
     },
   };
 
-  const wsProxyOptions: Options = {
+  const wsProxy = createProxyMiddleware({
     target: PYTHON_API_URL,
-    ws: true,
     changeOrigin: true,
+    ws: true,
     on: {
       error: (err: Error) => {
         log(`WebSocket proxy error: ${err.message}`, "proxy");
       },
     },
-  };
+  });
 
   app.use("/api", createProxyMiddleware(apiProxyOptions));
-  app.use("/ws", createProxyMiddleware(wsProxyOptions));
+  app.use("/ws", wsProxy);
+
+  httpServer.on("upgrade", (req, socket, head) => {
+    if (req.url?.startsWith("/ws")) {
+      log("WebSocket upgrade request received", "proxy");
+      wsProxy.upgrade(req, socket as any, head);
+    }
+  });
 
   log(`Proxying /api and /ws to ${PYTHON_API_URL}`, "proxy");
 
