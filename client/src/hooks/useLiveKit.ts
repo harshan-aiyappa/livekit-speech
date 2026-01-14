@@ -33,39 +33,110 @@ export function useLiveKit(): UseLiveKitReturn {
   const audioTrackRef = useRef<LocalAudioTrack | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const sessionStartRef = useRef<number>(0);
-  const isStoppingRef = useRef(false);
+  const isActiveRef = useRef(false);
 
   useEffect(() => {
     return () => {
+      isActiveRef.current = false;
       if (roomRef.current) {
         roomRef.current.disconnect();
       }
-      if (wsRef.current) {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.close();
       }
     };
   }, []);
 
-  const connectWebSocket = useCallback((): Promise<WebSocket> => {
-    return new Promise((resolve, reject) => {
+  const startRecording = useCallback(async () => {
+    try {
+      isActiveRef.current = true;
+      setError(null);
+      setStatus("connecting");
+      setSegments([]);
+      setMode(null);
+
+      const response = await apiRequest("POST", "/api/livekit/token");
+      const tokenResponse = await response.json();
+      const { token, roomName: room } = tokenResponse;
+      setRoomName(room);
+
+      let useLiveMode = false;
+      
+      try {
+        const liveKitRoom = new Room({
+          audioCaptureDefaults: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+
+        roomRef.current = liveKitRoom;
+
+        liveKitRoom.on(RoomEvent.ConnectionStateChanged, (state) => {
+          console.log("LiveKit connection state:", state);
+        });
+
+        const wsUrl = import.meta.env.VITE_LIVEKIT_URL || "wss://kimo-zg71lj4i.livekit.cloud";
+        await liveKitRoom.connect(wsUrl, token);
+        console.log("LiveKit room connected");
+
+        const audioTrack = await createLocalAudioTrack({
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        });
+
+        audioTrackRef.current = audioTrack;
+        await liveKitRoom.localParticipant.publishTrack(audioTrack);
+        console.log("Audio track published");
+
+        const audioContext = new AudioContext();
+        const mediaStream = new MediaStream([audioTrack.mediaStreamTrack]);
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        
+        const updateLevel = () => {
+          if (!isActiveRef.current) return;
+          analyser.getByteFrequencyData(dataArray);
+          const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+          setAudioLevel(average / 255);
+          requestAnimationFrame(updateLevel);
+        };
+
+        requestAnimationFrame(updateLevel);
+        useLiveMode = true;
+      } catch (micError) {
+        console.warn("Microphone/LiveKit not available, using demo mode:", micError);
+        if (roomRef.current) {
+          roomRef.current.disconnect();
+          roomRef.current = null;
+        }
+      }
+
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log("WebSocket connected for transcription");
-        resolve(ws);
+        console.log("Transcription WebSocket connected");
       };
 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          console.log("WebSocket message:", data.type);
           
           if (data.type === "status") {
-            console.log("Server status:", data);
-            setMode(data.mode === "demo" ? "demo" : "live");
+            console.log("Server mode:", data.mode, "Whisper ready:", data.whisper_ready);
+            setMode(data.mode === "demo" ? "demo" : useLiveMode ? "live" : "demo");
           }
           
-          if (data.type === "transcript") {
+          if (data.type === "transcript" && data.text) {
             const segment: TranscriptSegment = {
               id: data.id || crypto.randomUUID(),
               timestamp: data.timestamp || Date.now() - sessionStartRef.current,
@@ -96,98 +167,19 @@ export function useLiveKit(): UseLiveKitReturn {
 
       ws.onerror = (e) => {
         console.error("WebSocket error:", e);
-        if (ws.readyState !== WebSocket.OPEN) {
-          reject(e);
-        }
       };
 
-      ws.onclose = () => {
-        console.log("WebSocket closed");
-        if (!isStoppingRef.current && isRecording) {
+      ws.onclose = (e) => {
+        console.log("WebSocket closed, code:", e.code, "reason:", e.reason);
+        if (isActiveRef.current) {
           setStatus("disconnected");
           setIsRecording(false);
+          isActiveRef.current = false;
         }
       };
 
-      wsRef.current = ws;
-    });
-  }, [isRecording]);
-
-  const startRecording = useCallback(async () => {
-    try {
-      isStoppingRef.current = false;
-      setError(null);
-      setStatus("connecting");
-      setSegments([]);
-      setMode(null);
-
-      const response = await apiRequest("POST", "/api/livekit/token");
-      const tokenResponse = await response.json();
-      const { token, roomName: room } = tokenResponse;
-      setRoomName(room);
-
-      let liveKitConnected = false;
-      
-      try {
-        const liveKitRoom = new Room({
-          audioCaptureDefaults: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-
-        roomRef.current = liveKitRoom;
-
-        liveKitRoom.on(RoomEvent.ConnectionStateChanged, (state) => {
-          console.log("Connection state:", state);
-        });
-
-        const wsUrl = import.meta.env.VITE_LIVEKIT_URL || "wss://kimo-zg71lj4i.livekit.cloud";
-        await liveKitRoom.connect(wsUrl, token);
-        liveKitConnected = true;
-
-        const audioTrack = await createLocalAudioTrack({
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        });
-
-        audioTrackRef.current = audioTrack;
-        
-        await liveKitRoom.localParticipant.publishTrack(audioTrack);
-
-        const audioContext = new AudioContext();
-        const mediaStream = new MediaStream([audioTrack.mediaStreamTrack]);
-        const source = audioContext.createMediaStreamSource(mediaStream);
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        source.connect(analyser);
-
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        
-        const updateLevel = () => {
-          if (!isStoppingRef.current && roomRef.current) {
-            analyser.getByteFrequencyData(dataArray);
-            const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-            setAudioLevel(average / 255);
-            requestAnimationFrame(updateLevel);
-          }
-        };
-
-        requestAnimationFrame(updateLevel);
-        setMode("live");
-      } catch (micError) {
-        console.warn("Microphone/LiveKit not available, running in demo mode:", micError);
-        setMode("demo");
-        if (roomRef.current) {
-          roomRef.current.disconnect();
-          roomRef.current = null;
-        }
-      }
-
-      await connectWebSocket();
       sessionStartRef.current = Date.now();
+      setMode(useLiveMode ? "live" : "demo");
       setStatus("connected");
       setIsRecording(true);
 
@@ -196,11 +188,12 @@ export function useLiveKit(): UseLiveKitReturn {
       setError(err instanceof Error ? err.message : "Failed to start recording");
       setStatus("error");
       setIsRecording(false);
+      isActiveRef.current = false;
     }
-  }, [connectWebSocket]);
+  }, []);
 
   const stopRecording = useCallback(() => {
-    isStoppingRef.current = true;
+    isActiveRef.current = false;
     
     if (audioTrackRef.current) {
       audioTrackRef.current.stop();
@@ -212,8 +205,8 @@ export function useLiveKit(): UseLiveKitReturn {
       roomRef.current = null;
     }
 
-    if (wsRef.current) {
-      wsRef.current.close();
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.close(1000, "User stopped recording");
       wsRef.current = null;
     }
 
