@@ -71,7 +71,7 @@ class TokenRequest(BaseModel):
     roomName: Optional[str] = None
     identity: Optional[str] = None
 
-@app.post("/livekit/token")
+@app.post("/api/livekit/token")
 async def generate_token(request: TokenRequest = None):
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         return {"error": "LiveKit not configured"}, 500
@@ -105,21 +105,20 @@ async def generate_token(request: TokenRequest = None):
 
 
 def transcribe_audio(audio_data: bytes) -> dict:
-    global whisper_model
     if whisper_model is None:
         return {"text": "", "error": "Whisper model not loaded"}
     
     try:
-        # Use delete=False because on Windows we can't open the file again while it's open
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            tmp_file.write(audio_data)
-            tmp_file.flush()
-            tmp_filename = tmp_file.name
-            
+        # Create an in-memory buffer for the audio data
+        # faster-whisper accepts a file-like object (BinaryIO)
+        audio_buffer = io.BytesIO(audio_data)
+        
         try:
             with whisper_lock:
+                # faster-whisper handles decoding and resampling internally 
+                # when provided with a file-like object containing valid media (WAV/WebM)
                 segments, info = whisper_model.transcribe(
-                    tmp_filename,
+                    audio_buffer,
                     beam_size=1,
                     language="en",
                     vad_filter=True,
@@ -142,13 +141,10 @@ def transcribe_audio(audio_data: bytes) -> dict:
                     "language": info.language,
                     "language_probability": info.language_probability
                 }
-        finally:
-            # Clean up the temp file
-            if os.path.exists(tmp_filename):
-                try:
-                    os.remove(tmp_filename)
-                except Exception as e:
-                    print(f"Failed to delete temp file: {e}")
+                
+        except Exception as e:
+            print(f"Transcription processing error: {e}")
+            return {"text": "", "error": str(e)}
 
     except Exception as e:
         print(f"Transcription error: {e}")
