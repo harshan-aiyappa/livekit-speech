@@ -1,6 +1,6 @@
-# Vocalis - Real-time Voice Transcription
+# livekit-speech - Real-time Voice Transcription
 
-Vocalis is a high-performance, real-time speech-to-text application built with React, LiveKit, and Faster-Whisper. It provides zero-cost transcription using local inference.
+livekit-speech is a high-performance, real-time speech-to-text application built with React, LiveKit, and Faster-Whisper. It provides zero-cost transcription using local inference.
 
 ## 🚀 Features
 

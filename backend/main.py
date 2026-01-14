@@ -16,10 +16,11 @@ import numpy as np
 from faster_whisper import WhisperModel
 
 # Web Server
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import base64
 
 # Load env vars
 load_dotenv()
@@ -72,9 +73,174 @@ async def create_token(req: TokenRequest):
         "livekit_url": LIVEKIT_URL
     }
 
-@app.get("/health")
+@app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time audio transcription.
+    Receives base64-encoded audio chunks and returns transcriptions.
+    """
+    await websocket.accept()
+    logger.info("🔌 WebSocket client connected")
+    
+    # Initialize ASR engine if not already loaded
+    global asr_engine
+    if not asr_engine:
+        asr_engine = MedicalASR()
+    
+    # Send status to client
+    await websocket.send_json({
+        "type": "status",
+        "whisper_ready": True,
+        "mode": "live"
+    })
+    
+    try:
+        while True:
+            # Receive message from client
+            data = await websocket.receive_json()
+            logger.info(f"📨 Received WebSocket message type: {data.get('type')}")
+            
+            if data.get("type") == "audio_chunk":
+                try:
+                    # Decode base64 audio data
+                    audio_base64 = data.get("data", "")
+                    audio_bytes = base64.b64decode(audio_base64)
+                    
+                    logger.info(f"🎵 Received audio chunk: {len(audio_bytes)} bytes")
+                    
+                    # Save audio chunk to temporary file
+                    import tempfile
+                    import io
+                    from pydub import AudioSegment
+                    # Configure ffmpeg path
+                    import shutil
+                    import os
+                    
+                    ffmpeg_path = shutil.which("ffmpeg")
+                    if not ffmpeg_path:
+                        # Try common installation paths
+                        possible_paths = [
+                            r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+                            r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+                            r"C:\ffmpeg\bin\ffmpeg.exe",
+                            os.path.expanduser(r"~\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin\ffmpeg.exe"),
+                        ]
+                        for path in possible_paths:
+                            if os.path.exists(path):
+                                ffmpeg_path = path
+                                break
+                    
+                    if ffmpeg_path:
+                        # Add ffmpeg directory to PATH so pydub can find both ffmpeg and ffprobe
+                        ffmpeg_dir = os.path.dirname(ffmpeg_path)
+                        os.environ["PATH"] += os.pathsep + ffmpeg_dir
+                        
+                        AudioSegment.converter = ffmpeg_path
+                        # Also set ffprobe path manually if possible, though adding to PATH usually fixes it
+                        AudioSegment.ffprobe = os.path.join(ffmpeg_dir, "ffprobe.exe")
+                        
+                        logger.info(f"🔧 configured ffmpeg/ffprobe at: {ffmpeg_dir}")
+                    else:
+                        logger.error("❌ ffmpeg not found! Install ffmpeg first.")
+                        raise FileNotFoundError("ffmpeg not found")
+                    
+                    # Save audio chunk to temporary file
+                    import tempfile
+                    import io
+                    from pydub import AudioSegment
+                    
+                    # Create temporary WebM file
+                    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_webm:
+                        temp_webm.write(audio_bytes)
+                        temp_webm_path = temp_webm.name
+                    
+                    logger.info(f"💾 Saved WebM to: {temp_webm_path}")
+                    
+                    try:
+                        # Convert WebM to WAV using pydub
+                        logger.info("🔄 Converting WebM to WAV...")
+                        audio = AudioSegment.from_file(temp_webm_path, format="webm")
+                        
+                        # Convert to mono, 16kHz (Whisper's preferred format)
+                        audio = audio.set_channels(1)
+                        audio = audio.set_frame_rate(16000)
+                        
+                        # Export to WAV in memory
+                        wav_buffer = io.BytesIO()
+                        audio.export(wav_buffer, format="wav")
+                        wav_buffer.seek(0)
+                        
+                        # Save to temporary WAV file for Whisper
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+                            temp_wav.write(wav_buffer.read())
+                            temp_wav_path = temp_wav.name
+                        
+                        logger.info(f"✅ Converted to WAV: {temp_wav_path}")
+                        
+                        # Transcribe using Whisper
+                        logger.info("🧠 Running Whisper transcription...")
+                        segments, info = asr_engine.model.transcribe(
+                            temp_wav_path,
+                            beam_size=1,
+                            language="en",
+                            vad_filter=True,
+                            vad_parameters=dict(min_silence_duration_ms=500)
+                        )
+                        
+                        # Extract text from segments
+                        transcribed_text = " ".join([segment.text for segment in segments]).strip()
+                        
+                        logger.info(f"📝 Transcription: '{transcribed_text}'")
+                        
+                        # Send transcription back to client
+                        if transcribed_text:
+                            transcript_response = {
+                                "type": "transcript",
+                                "text": transcribed_text,
+                                "timestamp": data.get("timestamp", 0),
+                                "isFinal": True,
+                                "confidence": 1.0,
+                                "id": f"chunk-{data.get('timestamp', 0)}"
+                            }
+                            
+                            logger.info(f"📤 Sending transcript: '{transcribed_text}'")
+                            await websocket.send_json(transcript_response)
+                            logger.info("✅ Transcript sent successfully")
+                        else:
+                            logger.info("🔇 No speech detected in audio chunk")
+                        
+                        # Clean up temporary files
+                        import os
+                        try:
+                            os.unlink(temp_webm_path)
+                            os.unlink(temp_wav_path)
+                        except:
+                            pass
+                            
+                    except Exception as conversion_error:
+                        logger.error(f"❌ Audio conversion/transcription error: {conversion_error}")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"Conversion error: {str(conversion_error)}"
+                        })
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error processing audio chunk: {e}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": str(e)
+                    })
+    
+    except WebSocketDisconnect:
+        logger.info("👋 WebSocket client disconnected")
+    except Exception as e:
+        logger.error(f"💥 WebSocket error: {e}")
+        await websocket.close()
 
 
 # --- ASR Worker Logic ---

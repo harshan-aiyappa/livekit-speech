@@ -18,3 +18,5 @@ soundfile
 
 aiohttp
 loguru
+pydub
+ffmpeg-python
