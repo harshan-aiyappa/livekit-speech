@@ -8,11 +8,11 @@ export default defineConfig({
   ],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "frontend", "src"),
-      "@shared": path.resolve(__dirname, "frontend", "src", "shared"),
+      "@": path.resolve(__dirname, "src"),
+      "@shared": path.resolve(__dirname, "src", "shared"),
     },
   },
-  root: path.resolve(__dirname, "frontend"),
+  root: ".",
   build: {
     outDir: path.resolve(__dirname, "dist/public"),
     emptyOutDir: true,

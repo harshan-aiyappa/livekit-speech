@@ -1,23 +1,45 @@
 import os
-import time
 import asyncio
 import json
-import io
-import base64
-import tempfile
-from datetime import datetime, timedelta
-from typing import Optional
+import logging
+import signal
 import threading
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from livekit import api
 from dotenv import load_dotenv
 
+# LiveKit & Signal Processing
+from livekit import api, agents
+from livekit.agents import JobContext, WorkerOptions, cli
+from livekit.plugins import silero
+import numpy as np
+
+# ASR
+from faster_whisper import WhisperModel
+
+# Web Server
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
+
+# Load env vars
 load_dotenv()
 
-app = FastAPI(title="Voice Transcription API")
+# Configure Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("asr-worker")
 
+# --- Configuration ---
+LIVEKIT_URL = os.getenv("LIVEKIT_URL")
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+API_PORT = int(os.getenv("API_PORT", 8000))
+
+if not all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]):
+    logger.error("❌ LiveKit credentials missing. Check .env file.")
+    exit(1)
+
+# --- FastAPI Setup (Token Server) ---
+app = FastAPI(title="LiveKit Voice Agent API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,248 +48,200 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
-LIVEKIT_URL = os.getenv("LIVEKIT_URL")
-
-whisper_model = None
-whisper_lock = threading.Lock()
-
-def load_whisper_model():
-    global whisper_model
-    try:
-        from faster_whisper import WhisperModel
-        print("Loading faster-whisper model (tiny)...")
-        whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        print("Whisper model loaded successfully!")
-        return True
-    except Exception as e:
-        print(f"Failed to load Whisper model: {e}")
-        return False
-
-@app.on_event("startup")
-async def startup_event():
-    threading.Thread(target=load_whisper_model, daemon=True).start()
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "whisper_loaded": whisper_model is not None
-    }
-
-@app.get("/api/health")
-async def health_check_with_prefix():
-    return {
-        "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "whisper_loaded": whisper_model is not None
-    }
-
-from pydantic import BaseModel
-
 class TokenRequest(BaseModel):
-    roomName: Optional[str] = None
-    identity: Optional[str] = None
+    room_name: str
+    participant_name: str
 
 @app.post("/api/livekit/token")
-async def generate_token(request: TokenRequest = None):
-    if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
-        return {"error": "LiveKit not configured"}, 500
-    
-    # Use provided values or defaults
-    room_name = request.roomName if request and request.roomName else f"transcription-{int(time.time() * 1000)}"
-    identity = request.identity if request and request.identity else f"user-{int(time.time() * 1000)}"
-    
+async def create_token(req: TokenRequest):
+    """
+    Generates a LiveKit access token for the frontend client.
+    """
     token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
-        .with_identity(identity) \
-        .with_name(identity) \
-        .with_ttl(timedelta(hours=1)) \
+        .with_identity(req.participant_name) \
+        .with_name(req.participant_name) \
         .with_grants(api.VideoGrants(
-            room=room_name,
             room_join=True,
+            room=req.room_name,
             can_publish=True,
-            can_subscribe=True,
-            can_publish_data=True,
+            can_subscribe=True
         ))
     
-    jwt_token = token.to_jwt()
-    
-    print(f"Generated token for room: {room_name}, identity: {identity}")
-    
     return {
-        "token": jwt_token,
-        "roomName": room_name,
-        "identity": identity,
-        "livekitUrl": LIVEKIT_URL or "wss://kimo-zg71lj4i.livekit.cloud"
+        "token": token.to_jwt(),
+        "livekit_url": LIVEKIT_URL
     }
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
-def transcribe_audio(audio_data: bytes) -> dict:
-    if whisper_model is None:
-        return {"text": "", "error": "Whisper model not loaded"}
-    
-    try:
-        # Create an in-memory buffer for the audio data
-        # faster-whisper accepts a file-like object (BinaryIO)
-        audio_buffer = io.BytesIO(audio_data)
+
+# --- ASR Worker Logic ---
+
+class MedicalASR:
+    """
+    Manages the faster-whisper model and VAD for transcription
+    """
+    def __init__(self):
+        logger.info("⏳ Loading Whisper (tiny) model...")
+        # Run on CPU with int8 quantization for speed/compatibility
+        self.model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        logger.info("✅ Whisper loaded.")
         
-        try:
-            with whisper_lock:
-                # faster-whisper handles decoding and resampling internally 
-                # when provided with a file-like object containing valid media (WAV/WebM)
-                segments, info = whisper_model.transcribe(
-                    audio_buffer,
-                    beam_size=1,
-                    language="en",
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500)
+        # VAD State (Simple Energy-based or WebRTCVAD)
+        # We will use simple energy/VAD logic in the processing loop
+        
+    async def transcribe_buffer(self, audio_data: np.ndarray, sample_rate: int):
+        """
+        Transcribes raw float32 audio data.
+        """
+        # Convert to text using faster-whisper
+        # faster-whisper expects float32 array
+        segments, _ = self.model.transcribe(
+            audio_data, 
+            beam_size=1, 
+            language="en",
+            vad_filter=True
+        )
+        
+        full_text = " ".join([s.text for s in segments]).strip()
+        return full_text
+
+# Global ASR instance
+asr_engine = None
+
+async def entrypoint(ctx: JobContext):
+    """
+    Main LiveKit Agent Entrypoint.
+    Called when a new job (room connection) is assigned to this worker.
+    """
+    global asr_engine
+    if not asr_engine:
+        asr_engine = MedicalASR()
+
+    logger.info(f"🚀 Agent connecting to room: {ctx.room.name}")
+    await ctx.connect()
+    logger.info(f"✅ Connected to room: {ctx.room.name}")
+
+    # Subscribe to all audio tracks from users
+    @ctx.room.on("track_subscribed")
+    def on_track_subscribed(track, publication, participant):
+        if track.kind == "audio":
+            logger.info(f"🎤 Subscribed to audio from {participant.identity}")
+            asyncio.create_task(process_audio_track(ctx, track, participant))
+
+    # Wait for the job to close
+    # ctx.wait_for_shutdown() is handled by the worker framework usually, 
+    # but we can keep the coroutine alive if needed.
+
+async def process_audio_track(ctx: JobContext, track, participant):
+    """
+    Reads audio frames from the track, buffers them, and runs ASR.
+    """
+    # Create an audio stream (yielding AudioFrames)
+    audio_stream = agents.utils.AudioStream(track)
+    
+    # We will accumulate audio data (PCM 16kHz mono)
+    audio_buffer = bytearray()
+    
+    # Configuration
+    SAMPLE_RATE = 16000
+    BYTES_PER_SAMPLE = 2 # int16
+    BUFFER_SECONDS = 3.0 
+    BUFFER_SIZE_BYTES = int(SAMPLE_RATE * BYTES_PER_SAMPLE * BUFFER_SECONDS)
+    
+    logger.info(f"🎧 Started processing audio for {participant.identity}")
+    
+    # Transcription loop
+    async for frame in audio_stream:
+        # frame.data is the raw PCM bytes
+        audio_buffer.extend(frame.data.tobytes())
+        
+        # If buffer is full enough, process it
+        if len(audio_buffer) >= BUFFER_SIZE_BYTES:
+            # 1. Prepare chunks
+            # In a real VAD app, we would split on silence.
+            # Here for minimal viability, we transcribe the whole chunk.
+            
+            # Convert to numpy for faster-whisper (float32)
+            # 16-bit int -> float32
+            audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            # 2. Transcribe
+            # Run in executor to avoid blocking the async event loop
+            try:
+                loop = asyncio.get_running_loop()
+                text = await loop.run_in_executor(
+                    None, 
+                    # Use a lambda or partial to pass arguments
+                    lambda: asr_engine.model.transcribe(audio_np, beam_size=1, language="en")[0]
                 )
                 
-                text_segments = []
-                for segment in segments:
-                    text_segments.append({
-                        "start": segment.start,
-                        "end": segment.end,
-                        "text": segment.text.strip(),
-                    })
+                # 'text' is a generator of segments
+                full_transcription = " ".join([seg.text for seg in text]).strip()
                 
-                full_text = " ".join([s["text"] for s in text_segments])
-                
-                return {
-                    "text": full_text,
-                    "segments": text_segments,
-                    "language": info.language,
-                    "language_probability": info.language_probability
-                }
-                
-        except Exception as e:
-            print(f"Transcription processing error: {e}")
-            return {"text": "", "error": str(e)}
-
-    except Exception as e:
-        print(f"Transcription error: {e}")
-        return {"text": "", "error": str(e)}
-
-
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-
-    async def send_transcript(self, websocket: WebSocket, data: dict):
-        await websocket.send_json(data)
-
-
-manager = ConnectionManager()
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    print("WebSocket client connected")
-    
-    segment_counter = 0
-    session_start = time.time()
-    
-    await manager.send_transcript(websocket, {
-        "type": "status",
-        "whisper_ready": whisper_model is not None,
-        "mode": "live"
-    })
-    
-    try:
-        while True:
-            data = await websocket.receive()
-            
-            if "bytes" in data:
-                audio_bytes = data["bytes"]
-                segment_counter += 1
-                print(f"Received audio chunk: {len(audio_bytes)} bytes")
-                
-                await manager.send_transcript(websocket, {
-                    "type": "transcript",
-                    "id": f"segment-{segment_counter}",
-                    "timestamp": int((time.time() - session_start) * 1000),
-                    "text": "Transcribing...",
-                    "isFinal": False,
-                })
-                
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(None, transcribe_audio, audio_bytes)
-                
-                if result.get("text"):
-                    await manager.send_transcript(websocket, {
+                if full_transcription:
+                    logger.info(f"📝 Transcript [{participant.identity}]: {full_transcription}")
+                    
+                    # 3. Send back to frontend via Data Packet
+                    # The message format matches what the frontend expects
+                    payload = json.dumps({
                         "type": "transcript",
-                        "id": f"segment-{segment_counter}",
-                        "timestamp": int((time.time() - session_start) * 1000),
-                        "text": result["text"],
-                        "confidence": result.get("language_probability", 0.9),
-                        "speaker": "Speaker 1",
+                        "text": full_transcription,
                         "isFinal": True,
-                        "mode": "live"
+                        "timestamp": int(time.time() * 1000),
+                        "participantId": participant.identity
                     })
-                elif result.get("error"):
-                    print(f"Transcription failed: {result['error']}")
+                    
+                    await ctx.room.local_participant.publish_data(
+                        payload, 
+                        topic="transcription",
+                        reliable=True
+                    )
             
-            elif "text" in data:
-                try:
-                    message = json.loads(data["text"])
-                    print(f"Received message: {message}")
-                    
-                    if message.get("type") == "audio_chunk" and "data" in message:
-                        audio_data = base64.b64decode(message["data"])
-                        segment_counter += 1
-                        print(f"Received base64 audio: {len(audio_data)} bytes")
-                        
-                        loop = asyncio.get_event_loop()
-                        result = await loop.run_in_executor(None, transcribe_audio, audio_data)
-                        
-                        if result.get("text"):
-                            await manager.send_transcript(websocket, {
-                                "type": "transcript",
-                                "id": f"segment-{segment_counter}",
-                                "timestamp": int((time.time() - session_start) * 1000),
-                                "text": result["text"],
-                                "confidence": result.get("language_probability", 0.9),
-                                "speaker": "Speaker 1",
-                                "isFinal": True,
-                                "mode": "live"
-                            })
-                    
-                    elif message.get("type") == "ping":
-                        await manager.send_transcript(websocket, {"type": "pong"})
-                        
-                except json.JSONDecodeError:
-                    print("Failed to parse WebSocket message")
-                    
-    except WebSocketDisconnect:
-        print("WebSocket client disconnected")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-    finally:
-        manager.disconnect(websocket)
+            except Exception as e:
+                logger.error(f"ASR Error: {e}")
+            
+            # Reset buffer usually, or sliding window.
+            # Simple approach: clear buffer
+            audio_buffer.clear()
 
 
-@app.post("/transcribe")
-async def transcribe_file(file: UploadFile = File(...)):
-    if whisper_model is None:
-        return {"error": "Whisper model not loaded yet, please wait..."}
+# --- Main Application Runner ---
+
+def run_fastapi():
+    config = uvicorn.Config(app, host="0.0.0.0", port=API_PORT, loop="asyncio")
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve())
+
+def run_worker():
+    # Initialize the worker
+    # Note: cli.run_app is blocking, so we need to run it carefully or use dev runner
+    # For this hybrid setup (FastAPI + Worker in one process), we start FastAPI in a thread
+    # and run the Worker in the main thread (or vice versa).
+    # LiveKit Agents usually want main thread for signals.
     
-    audio_data = await file.read()
-    result = transcribe_audio(audio_data)
-    return result
-
+    # Start FastAPI in background thread
+    t = threading.Thread(target=run_fastapi, daemon=True)
+    t.start()
+    
+    # Run Agent
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("API_PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Check for arguments to decide mode, or just run both for 'dev'
+    print(f"🚀 Starting Hybrid Server (API on {API_PORT} + LiveKit Worker)...")
+    
+    # We use a slight hack to run both: 
+    # run_app() blocks, so we launch API first.
+    t = threading.Thread(target=run_fastapi, daemon=True)
+    t.start()
+    
+    # Run the worker listener
+    # Default to 'dev' mode if no command provided
+    import sys
+    if len(sys.argv) == 1:
+        sys.argv.append("dev")
+        
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

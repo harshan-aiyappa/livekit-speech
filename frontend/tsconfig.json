@@ -1,8 +1,6 @@
 {
   "include": [
-    "frontend/src/**/*",
-    "backend/**/*",
-    "scripts/**/*"
+    "src/**/*"
   ],
   "exclude": [
     "node_modules",
@@ -33,10 +31,10 @@
     ],
     "paths": {
       "@/*": [
-        "./frontend/src/*"
+        "./src/*"
       ],
       "@shared/*": [
-        "./frontend/src/shared/*"
+        "./src/shared/*"
       ]
     }
   }
