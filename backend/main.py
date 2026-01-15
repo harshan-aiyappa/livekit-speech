@@ -35,6 +35,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("asr-worker")
 # Silence verbose AI logs
 logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+# Silence pydub/ffmpeg debug logs
+logging.getLogger("pydub.converter").setLevel(logging.WARNING)
 
 # --- Configuration ---
 LIVEKIT_URL = os.getenv("LIVEKIT_URL")
@@ -156,10 +158,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     session_audio_buffer.extend(audio_bytes)
                     
                     # Process every ~0.8 second or so to keep UI snappy
-                    if time.time() - last_process_time < 0.8:
-                        continue
-                        
                     last_process_time = time.time()
+                    
+                    # Safeguard: if buffer is too big (>1MB) without a header, something is wrong
+                    if len(session_audio_buffer) > 1024 * 1024:
+                        logger.warning("[WS MODE] ⚠️ Buffer overflow, resetting...")
+                        session_audio_buffer = bytearray(audio_bytes) # Start fresh with current chunk
                     
                     try:
                         # Convert the FULL accumulated buffer to WAV

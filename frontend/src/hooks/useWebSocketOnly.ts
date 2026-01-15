@@ -129,7 +129,7 @@ export function useWebSocketOnly() {
                 }
             };
 
-            recorder.start(250); // 250ms chunks for lower latency
+            recorder.start(500); // 500ms chunks for a good balance of latency and stability
             setIsRecording(true);
             setLatency(0);
 
