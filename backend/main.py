@@ -107,11 +107,20 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if data.get("type") == "audio_chunk":
                 try:
+                    # Track processing start time
+                    import time
+                    process_start = time.time()
+                    
                     # Decode base64 audio data
                     audio_base64 = data.get("data", "")
                     audio_bytes = base64.b64decode(audio_base64)
                     
                     logger.info(f"🎵 Received audio chunk: {len(audio_bytes)} bytes")
+                    
+                    # Skip chunks smaller than 40KB (likely incomplete/corrupt or too short)
+                    if len(audio_bytes) < 40000:
+                        logger.warning(f"⚠️ Skipping small audio chunk ({len(audio_bytes)} bytes) - likely incomplete or too short for accurate transcription")
+                        continue
                     
                     # Save audio chunk to temporary file
                     import tempfile
@@ -182,14 +191,20 @@ async def websocket_endpoint(websocket: WebSocket):
                         
                         logger.info(f"✅ Converted to WAV: {temp_wav_path}")
                         
-                        # Transcribe using Whisper
+                        # Transcribe using Whisper - OPTIMIZED FOR SPEED
                         logger.info("🧠 Running Whisper transcription...")
                         segments, info = asr_engine.model.transcribe(
                             temp_wav_path,
-                            beam_size=1,
+                            beam_size=1,  # Fast decoding
                             language="en",
                             vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=500)
+                            vad_parameters=dict(min_silence_duration_ms=500),
+                            # SPEED OPTIMIZATIONS - disable quality checks that slow down processing
+                            condition_on_previous_text=False,  # Don't use context (faster)
+                            compression_ratio_threshold=None,  # Disable compression checks (was causing 37s delays!)
+                            logprob_threshold=None,  # Disable quality checks
+                            no_speech_threshold=0.6,  # Standard threshold
+                            temperature=0.0  # Deterministic, no retries
                         )
                         
                         # Extract text from segments
@@ -199,16 +214,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         
                         # Send transcription back to client
                         if transcribed_text:
+                            # Calculate processing time
+                            process_end = time.time()
+                            turnaround_ms = int((process_end - process_start) * 1000)
+                            
                             transcript_response = {
                                 "type": "transcript",
                                 "text": transcribed_text,
                                 "timestamp": data.get("timestamp", 0),
                                 "isFinal": True,
                                 "confidence": 1.0,
-                                "id": f"chunk-{data.get('timestamp', 0)}"
+                                "id": f"chunk-{data.get('timestamp', 0)}",
+                                "turnaround_ms": turnaround_ms  # Time taken to process
                             }
                             
-                            logger.info(f"📤 Sending transcript: '{transcribed_text}'")
+                            logger.info(f"📤 Sending transcript: '{transcribed_text}' (processed in {turnaround_ms}ms)")
                             await websocket.send_json(transcript_response)
                             logger.info("✅ Transcript sent successfully")
                         else:
@@ -250,9 +270,9 @@ class MedicalASR:
     Manages the faster-whisper model and VAD for transcription
     """
     def __init__(self):
-        logger.info("⏳ Loading Whisper (tiny) model...")
+        logger.info("⏳ Loading Whisper (base) model...")
         # Run on CPU with int8 quantization for speed/compatibility
-        self.model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        self.model = WhisperModel("base", device="cpu", compute_type="int8")
         logger.info("✅ Whisper loaded.")
         
         # VAD State (Simple Energy-based or WebRTCVAD)

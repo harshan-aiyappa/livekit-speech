@@ -5,6 +5,7 @@ export interface TranscriptSegment {
     confidence?: number;
     speaker?: string;
     isFinal: boolean;
+    turnaround_ms?: number; // Processing time (audio received → transcript returned)
 }
 
 export interface LiveKitTokenResponse {

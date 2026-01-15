@@ -100,14 +100,13 @@ export function TranscriptDisplay({
             {segments.map((segment) => (
               <div
                 key={segment.id}
-                className={`p-3 rounded-lg border transition-opacity duration-300 ${
-                  segment.isFinal
+                className={`p-3 rounded-lg border transition-opacity duration-300 ${segment.isFinal
                     ? "bg-card border-card-border"
                     : "bg-muted/50 border-muted/30 opacity-70"
-                }`}
+                  }`}
                 data-testid={`segment-${segment.id}`}
               >
-                <div className="flex items-center gap-2 mb-1">
+                <div className="flex items-center gap-2 mb-1 flex-wrap">
                   <span className="text-xs font-mono text-muted-foreground">
                     {formatTimestamp(segment.timestamp)}
                   </span>
@@ -119,6 +118,11 @@ export function TranscriptDisplay({
                   {segment.confidence !== undefined && (
                     <span className="text-xs text-muted-foreground/60">
                       {Math.round(segment.confidence * 100)}%
+                    </span>
+                  )}
+                  {segment.turnaround_ms !== undefined && (
+                    <span className="text-xs font-mono text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-900/20 px-2 py-0.5 rounded">
+                      ⚡ {segment.turnaround_ms}ms TAT
                     </span>
                   )}
                 </div>

@@ -19,19 +19,18 @@ export function RecordButton({
       onClick={onClick}
       disabled={disabled || isConnecting}
       size="lg"
-      className={`h-24 w-24 rounded-full transition-all duration-300 ${
-        isRecording
-          ? "bg-destructive border-destructive-border"
-          : "bg-primary border-primary-border"
-      } ${isRecording ? "animate-pulse" : ""}`}
+      className={`h-24 w-24 rounded-full transition-all duration-300 ${isRecording
+          ? "bg-zinc-100 text-zinc-900 border-4 border-zinc-900 dark:bg-zinc-800 dark:text-zinc-100 dark:border-zinc-100"
+          : "bg-primary text-primary-foreground border-primary-border"
+        } ${isRecording ? "animate-pulse" : ""}`}
       data-testid="button-record"
     >
       {isConnecting ? (
-        <Loader2 className="h-10 w-10 text-primary-foreground animate-spin" />
+        <Loader2 className="h-10 w-10 animate-spin" />
       ) : isRecording ? (
-        <MicOff className="h-10 w-10 text-destructive-foreground" />
+        <MicOff className="h-10 w-10" />
       ) : (
-        <Mic className="h-10 w-10 text-primary-foreground" />
+        <Mic className="h-10 w-10" />
       )}
     </Button>
   );

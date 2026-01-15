@@ -1,6 +1,92 @@
-node_modules
-dist
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+venv311/
+venv312/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dist/
+.next/
+out/
+
+# Environment Variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
-server/public
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Project Specific
+# Whisper model cache (downloaded to user's home dir, but just in case)
+*.pt
+*.onnx
+models/
+.cache/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.temp/
+server/public/
 vite.config.ts.*
 *.tar.gz
+
+*.min.js
+*.min.css
+
+# Generated Images (AI-generated diagrams)
+*.png
+*.jpg
+*.jpeg
+*.webp
+!frontend/public/**/*.png
+!frontend/public/**/*.jpg
+
+# Package locks (too large, causes merge conflicts)
+# Include in git but be aware these can grow
+# Uncomment if you want to ignore:
+# package-lock.json
+# yarn.lock
+
+# Frontend specific
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+
+# Backend specific  
+backend/.pytest_cache/
+backend/htmlcov/
+backend/.coverage
+
+# Whisper downloads (models auto-download to ~/.cache/huggingface/)
