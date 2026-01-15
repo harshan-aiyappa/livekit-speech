@@ -428,11 +428,11 @@ async def process_audio_track(ctx: JobContext, track, participant, participant_c
             # Check Peak Volume
             peak = np.abs(audio_np).max()
             
-            # Skip AI processing if it's mostly silence
-            if peak < 0.01:
+            # Skip AI processing if it's mostly silence (Increased to 0.04 to block background hum)
+            if peak < 0.04:
                 continue
 
-            logger.info(f"[AGENT MODE] 🔊 Processing chunk (Peak: {peak:.4f})")
+            logger.info(f"[AGENT MODE] 🔊 Sound detected (Peak: {peak:.4f})")
             
             # 2. Transcribe in executor
             try:
@@ -442,8 +442,11 @@ async def process_audio_track(ctx: JobContext, track, participant, participant_c
                         data, 
                         beam_size=1, 
                         language=lang, 
-                        vad_filter=True, # Re-enabled now that peak is verified
-                        vad_parameters=dict(min_speech_duration_ms=100)
+                        vad_filter=True,
+                        # Ignore sounds shorter than 250ms (keyboard clicks, bumps)
+                        vad_parameters=dict(min_speech_duration_ms=250),
+                        # If Whisper is < 60% sure it's speech, ignore it
+                        no_speech_threshold=0.6
                     )
                     return " ".join([seg.text for seg in segments]).strip()
 
