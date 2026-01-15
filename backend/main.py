@@ -122,10 +122,14 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("🔌 WebSocket client connected")
     
-    # Initialize ASR engine if not already loaded
+    # Initialize ASR engine and session buffer
     global asr_engine
     if not asr_engine:
         asr_engine = MedicalASR()
+    
+    # Buffer to accumulate WebM chunks (must keep the header at the start)
+    session_audio_buffer = bytearray()
+    last_process_time = time.time()
     
     # Send status to client
     await websocket.send_json({
@@ -136,128 +140,81 @@ async def websocket_endpoint(websocket: WebSocket):
     
     try:
         while True:
-            # Receive message from client
             data = await websocket.receive_json()
-            logger.info(f"📨 Received WebSocket message type: {data.get('type')}")
             
             if data.get("type") == "audio_chunk":
                 try:
-                    # Track processing start time
-                    import time
                     process_start = time.time()
-                    
-                    # Decode base64 audio data
                     audio_base64 = data.get("data", "")
                     audio_bytes = base64.b64decode(audio_base64)
                     
-                    logger.info(f"[WS MODE] 🎵 Received audio chunk: {len(audio_bytes)} bytes")
+                    # Accumulate bytes
+                    session_audio_buffer.extend(audio_bytes)
                     
-                    # Skip chunks smaller than 1KB (likely just header or silence)
-                    if len(audio_bytes) < 1000:
-                        logger.warning(f"⚠️ Skipping small audio chunk ({len(audio_bytes)} bytes)")
+                    # Process every ~1 second or so to keep UI snappy
+                    # (Don't process tiny 250ms chunks individually to save CPU)
+                    if time.time() - last_process_time < 0.8:
                         continue
-                    
-                    # Save audio chunk to temporary file
-                    import tempfile
-                    import io
-                    from pydub import AudioSegment
-                    # Configure ffmpeg path
-                    import shutil
-                    import os
-                    
-                    ffmpeg_path = shutil.which("ffmpeg")
-                    if not ffmpeg_path:
-                        # Try common installation paths
-                        possible_paths = [
-                            r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
-                            r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-                            r"C:\ffmpeg\bin\ffmpeg.exe",
-                            os.path.expanduser(r"~\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin\ffmpeg.exe"),
-                        ]
-                        for path in possible_paths:
-                            if os.path.exists(path):
-                                ffmpeg_path = path
-                                break
-                    
-                    if ffmpeg_path:
-                        # Add ffmpeg directory to PATH so pydub can find both ffmpeg and ffprobe
-                        ffmpeg_dir = os.path.dirname(ffmpeg_path)
-                        os.environ["PATH"] += os.pathsep + ffmpeg_dir
                         
-                        AudioSegment.converter = ffmpeg_path
-                        # Also set ffprobe path manually if possible, though adding to PATH usually fixes it
-                        AudioSegment.ffprobe = os.path.join(ffmpeg_dir, "ffprobe.exe")
-                        
-                        logger.info(f"🔧 configured ffmpeg/ffprobe at: {ffmpeg_dir}")
-                    else:
-                        logger.error("❌ ffmpeg not found! Install ffmpeg first.")
-                        raise FileNotFoundError("ffmpeg not found")
-                    
-                    # Save audio chunk to temporary file
-                    import tempfile
-                    import io
-                    from pydub import AudioSegment
-                    
-                    # Create temporary WebM file
-                    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_webm:
-                        temp_webm.write(audio_bytes)
-                        temp_webm_path = temp_webm.name
-                    
-                    logger.info(f"💾 Saved WebM to: {temp_webm_path}")
+                    last_process_time = time.time()
                     
                     try:
-                        # Convert WebM to WAV using pydub
-                        logger.info("🔄 Converting WebM to WAV...")
-                        audio = AudioSegment.from_file(temp_webm_path, format="webm")
+                        # Convert the FULL accumulated buffer to WAV
+                        # FFmpeg needs the header at the start of the buffer to work
+                        audio = AudioSegment.from_file(io.BytesIO(session_audio_buffer), format="webm")
                         
-                        # Convert to mono, 16kHz (Whisper's preferred format)
-                        audio = audio.set_channels(1)
-                        audio = audio.set_frame_rate(16000)
+                        # Only take the last 15 seconds to keep it fast
+                        if len(audio) > 15000:
+                            audio = audio[-15000:]
+                            
+                        audio = audio.set_channels(1).set_frame_rate(16000)
                         
                         # Export to WAV in memory
                         wav_buffer = io.BytesIO()
                         audio.export(wav_buffer, format="wav")
                         wav_buffer.seek(0)
                         
-                        # Save to temporary WAV file for Whisper
+                        # Save to temp file for Whisper (needs a path or file-like object)
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
                             temp_wav.write(wav_buffer.read())
                             temp_wav_path = temp_wav.name
                         
-                        logger.info(f"✅ Converted to WAV: {temp_wav_path}")
-                        
-                        # Transcribe using Whisper - OPTIMIZED FOR SPEED
-                        logger.info("🧠 Running Whisper transcription...")
-                        segments, info = asr_engine.model.transcribe(
-                            temp_wav_path,
-                            beam_size=1,  # Fast decoding
-                            language=data.get("language", "en"),
-                            vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=500),
-                            # SPEED OPTIMIZATIONS - disable quality checks that slow down processing
-                            condition_on_previous_text=False,  # Don't use context (faster)
-                            compression_ratio_threshold=None,  # Disable compression checks (was causing 37s delays!)
-                            logprob_threshold=None,  # Disable quality checks
-                            no_speech_threshold=0.6,  # Standard threshold
-                            temperature=0.0  # Deterministic, no retries
+                        # Transcribe in executor
+                        def run_transcription(path, lang):
+                            segments, _ = asr_engine.model.transcribe(
+                                path,
+                                beam_size=1,
+                                language=lang,
+                                vad_filter=True,
+                                no_speech_threshold=0.6
+                            )
+                            return " ".join([s.text for s in segments]).strip()
+
+                        loop = asyncio.get_running_loop()
+                        transcribed_text = await loop.run_in_executor(
+                            None, 
+                            run_transcription, 
+                            temp_wav_path, 
+                            data.get("language", "en")
                         )
                         
-                        # Extract text from segments
-                        transcribed_text = " ".join([segment.text for segment in segments]).strip()
-                        
-                        logger.info(f"📝 Transcription: '{transcribed_text}'")
-                        
-                        # Send transcription back to client
+                        # Cleanup temp file
+                        try:
+                            os.unlink(temp_wav_path)
+                        except:
+                            pass
+
                         if transcribed_text:
-                            # Calculate processing time
                             process_end = time.time()
                             turnaround_ms = int((process_end - process_start) * 1000)
                             
-                            transcript_response = {
+                            await websocket.send_json({
                                 "type": "transcript",
                                 "text": transcribed_text,
                                 "timestamp": data.get("timestamp", 0),
                                 "isFinal": True,
+                                "turnaround_ms": turnaround_ms
+                            })
                                 "confidence": 1.0,
                                 "id": f"chunk-{data.get('timestamp', 0)}",
                                 "turnaround_ms": turnaround_ms  # Time taken to process
