@@ -22,6 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import base64
+import shutil
+import tempfile
+import io
+from pydub import AudioSegment
 
 # Load env vars
 load_dotenv()
@@ -151,8 +155,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Accumulate bytes
                     session_audio_buffer.extend(audio_bytes)
                     
-                    # Process every ~1 second or so to keep UI snappy
-                    # (Don't process tiny 250ms chunks individually to save CPU)
+                    # Process every ~0.8 second or so to keep UI snappy
                     if time.time() - last_process_time < 0.8:
                         continue
                         
@@ -160,7 +163,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     try:
                         # Convert the FULL accumulated buffer to WAV
-                        # FFmpeg needs the header at the start of the buffer to work
                         audio = AudioSegment.from_file(io.BytesIO(session_audio_buffer), format="webm")
                         
                         # Only take the last 15 seconds to keep it fast
@@ -174,7 +176,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         audio.export(wav_buffer, format="wav")
                         wav_buffer.seek(0)
                         
-                        # Save to temp file for Whisper (needs a path or file-like object)
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
                             temp_wav.write(wav_buffer.read())
                             temp_wav_path = temp_wav.name
@@ -208,45 +209,22 @@ async def websocket_endpoint(websocket: WebSocket):
                             process_end = time.time()
                             turnaround_ms = int((process_end - process_start) * 1000)
                             
+                            logger.info(f"[WS MODE] 📤 Transcript: '{transcribed_text}' ({turnaround_ms}ms)")
                             await websocket.send_json({
                                 "type": "transcript",
                                 "text": transcribed_text,
                                 "timestamp": data.get("timestamp", 0),
                                 "isFinal": True,
-                                "turnaround_ms": turnaround_ms
+                                "turnaround_ms": turnaround_ms,
+                                "id": f"chunk-{int(time.time()*1000)}"
                             })
-                                "confidence": 1.0,
-                                "id": f"chunk-{data.get('timestamp', 0)}",
-                                "turnaround_ms": turnaround_ms  # Time taken to process
-                            }
-                            
-                            logger.info(f"[WS MODE] 📤 Sending transcript: '{transcribed_text}' (processed in {turnaround_ms}ms)")
-                            await websocket.send_json(transcript_response)
-                            logger.info("[WS MODE] ✅ Transcript sent successfully")
-                        else:
-                            logger.info("[WS MODE] 🔇 No speech detected in audio chunk")
-                        
-                        # Clean up temporary files
-                        import os
-                        try:
-                            os.unlink(temp_webm_path)
-                            os.unlink(temp_wav_path)
-                        except:
-                            pass
                             
                     except Exception as conversion_error:
-                        logger.error(f"❌ Audio conversion/transcription error: {conversion_error}")
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": f"Conversion error: {str(conversion_error)}"
-                        })
+                        logger.error(f"❌ Conversion error: {conversion_error}")
+                        # Don't send error to client for every chunk, just log it
                     
                 except Exception as e:
                     logger.error(f"❌ Error processing audio chunk: {e}")
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": str(e)
-                    })
     
     except WebSocketDisconnect:
         logger.info("👋 WebSocket client disconnected")
