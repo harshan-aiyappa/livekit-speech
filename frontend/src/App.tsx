@@ -6,6 +6,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import Home from "@/pages/Home";
 import TestMode from "@/pages/TestMode";
 import PracticeMode from "@/pages/PracticeMode";
+import LiveKitTestMode from "@/pages/LiveKitTestMode";
+import WebSocketMode from "@/pages/WebSocketMode";
 import NotFound from "@/pages/not-found";
 
 function Router() {
@@ -13,6 +15,8 @@ function Router() {
     <Switch>
       <Route path="/" component={Home} />
       <Route path="/test" component={TestMode} />
+      <Route path="/livekit-test" component={LiveKitTestMode} />
+      <Route path="/websocket-test" component={WebSocketMode} />
       <Route path="/practice" component={PracticeMode} />
       <Route component={NotFound} />
     </Switch>

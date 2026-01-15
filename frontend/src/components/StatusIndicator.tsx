@@ -27,6 +27,11 @@ export function StatusIndicator({ status, roomName }: StatusIndicatorProps) {
       label: "Error",
       pulse: false,
     },
+    idle: {
+      color: "bg-zinc-500",
+      label: "Idle",
+      pulse: false,
+    },
   };
 
   const config = statusConfig[status];
@@ -35,9 +40,8 @@ export function StatusIndicator({ status, roomName }: StatusIndicatorProps) {
     <div className="flex items-center gap-2" data-testid="status-indicator">
       <div className="relative flex items-center">
         <span
-          className={`h-3 w-3 rounded-full ${config.color} ${
-            config.pulse ? "animate-pulse" : ""
-          }`}
+          className={`h-3 w-3 rounded-full ${config.color} ${config.pulse ? "animate-pulse" : ""
+            }`}
           data-testid="status-dot"
         />
         {config.pulse && (

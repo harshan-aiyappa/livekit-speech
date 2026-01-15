@@ -13,6 +13,7 @@ interface UseLiveKitReturn {
   isRecording: boolean;
   segments: TranscriptSegment[];
   audioLevel: number;
+  latency: number;
   startRecording: () => void;
   stopRecording: () => void;
   roomName: string | null;
@@ -30,6 +31,9 @@ export function useLiveKit(): UseLiveKitReturn {
   const [error, setError] = useState<string | null>(null);
   const [mode, setMode] = useState<"live" | null>(null);
   const [isInitializing, setIsInitializing] = useState(true);
+  const [latency, setLatency] = useState<number>(0);
+  const [language, _setLanguage] = useState<string>("en");
+  const languageRef = useRef("en");
 
   const roomRef = useRef<Room | null>(null);
   const audioTrackRef = useRef<LocalAudioTrack | null>(null);
@@ -53,10 +57,11 @@ export function useLiveKit(): UseLiveKitReturn {
         const newRoomName = `room-${crypto.randomUUID().substring(0, 8)}`;
         const participantName = `user-${crypto.randomUUID().substring(0, 8)}`;
 
-        // Get LiveKit token
+        // 1. Fetch Token from Backend
+        const uniqueRoomName = `test-room-${Math.floor(Date.now() / 1000).toString(36)}`;
         const response = await apiRequest("POST", "/api/livekit/token", {
-          room_name: newRoomName,
-          participant_name: participantName,
+          room_name: uniqueRoomName,
+          participant_name: `User-${Math.floor(Math.random() * 1000)}`,
         });
         const tokenResponse = await response.json();
         const { token } = tokenResponse;
@@ -142,8 +147,21 @@ export function useLiveKit(): UseLiveKitReturn {
               setMode("live");
             }
 
+            if (data.type === "error") {
+              console.error("[Hybrid] WS Error:", data.message);
+              toast({ title: "Transcription Error", description: data.message, variant: "destructive" });
+            }
+
             if (data.type === "transcript" && data.text) {
               console.log("Transcript received:", data);
+
+              // Calculate latency
+              if (data.timestamp) {
+                const nowRelative = Date.now() - sessionStartRef.current;
+                const currentLatency = nowRelative - data.timestamp;
+                setLatency(currentLatency > 0 ? currentLatency : 0);
+              }
+
               const segment: TranscriptSegment = {
                 id: data.id || crypto.randomUUID(),
                 timestamp: data.timestamp || Date.now() - sessionStartRef.current,
@@ -220,6 +238,11 @@ export function useLiveKit(): UseLiveKitReturn {
     };
   }, []);
 
+  const setLanguage = useCallback((lang: string) => {
+    _setLanguage(lang);
+    languageRef.current = lang;
+  }, []);
+
   // Start recording (just toggle, no reconnection)
   const startRecording = useCallback(() => {
     if (!audioTrackRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
@@ -245,16 +268,17 @@ export function useLiveKit(): UseLiveKitReturn {
             type: "audio_chunk",
             data: base64,
             timestamp: Date.now() - sessionStartRef.current,
+            language: languageRef.current
           }));
-          console.log(`📤 Sent audio chunk: ${event.data.size} bytes`);
+          console.log(`[Hybrid] 📤 Sent audio chunk: ${event.data.size} bytes`);
         }
       };
 
       // Small delay to ensure everything is ready
       setTimeout(() => {
         if (mediaRecorder.state === "inactive" && isActiveRef.current) {
-          mediaRecorder.start(3000);
-          console.log("🎙️ Recording started (instant toggle)");
+          mediaRecorder.start(1000); // 1s chunks
+          console.log("[Hybrid] 🎙️ Recording started");
         }
       }, 100);
 
@@ -262,12 +286,13 @@ export function useLiveKit(): UseLiveKitReturn {
       setSegments([]); // Clear previous transcripts
       setIsRecording(true);
       setError(null);
+      setLatency(0);
 
     } catch (err) {
       console.error("Failed to start recording:", err);
       setError(err instanceof Error ? err.message : "Failed to start recording");
     }
-  }, []);
+  }, [languageRef]); // Added languageRef to dependencies to ensure it's current
 
   // Stop recording (just pause, keep connection alive)
   const stopRecording = useCallback(() => {
@@ -292,5 +317,8 @@ export function useLiveKit(): UseLiveKitReturn {
     error,
     mode,
     isInitializing,
+    latency,
+    language,
+    setLanguage
   };
 }

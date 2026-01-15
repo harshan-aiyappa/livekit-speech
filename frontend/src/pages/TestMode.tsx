@@ -1,18 +1,17 @@
 
 import { useState, useEffect } from "react";
-import { Link } from "wouter";
-import { Settings, CheckCircle, AlertCircle, Wifi, Circle, Server, Mic, Radio, Brain, ArrowLeft } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { CheckCircle, AlertCircle, Server } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { ThemeToggle } from "@/components/ThemeToggle";
 import { StatusIndicator } from "@/components/StatusIndicator";
 import { RecordButton } from "@/components/RecordButton";
 import { AudioVisualizer } from "@/components/AudioVisualizer";
 import { SessionTimer } from "@/components/SessionTimer";
 import { TranscriptDisplay } from "@/components/TranscriptDisplay";
 import { useLiveKit } from "@/hooks/useLiveKit";
+import { LanguageSelector } from "@/components/LanguageSelector";
 import { useToast } from "@/hooks/use-toast";
 import { useQuery } from "@tanstack/react-query";
+import { PageLayout } from "@/components/layout/PageLayout";
 
 function StatusBadge({ label, status, detail }: { label: string; status: "ok" | "loading" | "error" | "idle"; detail?: string }) {
   const styles = {
@@ -48,7 +47,9 @@ export default function TestMode() {
     roomName,
     error,
     mode,
-    isInitializing,
+    latency,
+    language,
+    setLanguage,
   } = useLiveKit();
 
   const [sessionStart, setSessionStart] = useState<number | null>(null);
@@ -124,7 +125,7 @@ export default function TestMode() {
       setSessionStart(null);
     } else {
       setSessionStart(Date.now());
-      startRecording(); // Instant - no await needed!
+      startRecording();
     }
   };
 
@@ -134,32 +135,21 @@ export default function TestMode() {
   const livekitStatus = status === "connected" ? "ok" : status === "connecting" ? "loading" : status === "error" ? "error" : "idle";
   const websocketStatus = wsConnected ? "ok" : isRecording ? "loading" : "idle";
 
+  const headerActions = (
+    <div className="flex items-center gap-2">
+      <StatusIndicator status={status} roomName={roomName ?? undefined} />
+    </div>
+  );
+
   return (
-    <div className="min-h-screen bg-background flex flex-col">
-      {/* Modern Header */}
-      <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center px-6">
-          <Link href="/" className="mr-6 flex items-center gap-2 transition-colors hover:text-primary">
-            <ArrowLeft className="h-4 w-4" />
-            <span className="font-semibold">Back to Menu</span>
-          </Link>
-          <div className="mr-4 hidden md:flex">
-            <h1 className="text-xl font-bold text-foreground tracking-tight">
-              Test Mode
-            </h1>
-          </div>
-          <div className="flex flex-1 items-center justify-between space-x-2 md:justify-end">
-            <div className="flex items-center gap-2">
-              <StatusIndicator status={status} roomName={roomName ?? undefined} />
-              <ThemeToggle />
-            </div>
-          </div>
-        </div>
-      </header>
+    <PageLayout
+      title="Hybrid Test Mode"
+      subtitle="LiveKit Room + Custom WebSocket"
+      actions={headerActions}
+    >
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
 
-      <main className="flex-1 container py-8 px-6 max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8">
-
-        {/* Left Panel: Controls & Status */}
+        {/* Left Panel: Controls */}
         <div className="lg:col-span-4 flex flex-col gap-6">
 
           {/* Control Center */}
@@ -169,6 +159,7 @@ export default function TestMode() {
               <CardDescription>Manage your recording session</CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col items-center gap-6 py-6">
+              <LanguageSelector value={language} onChange={setLanguage} disabled={isRecording} />
               <div className="relative">
                 <div className={`absolute -inset-4 rounded-full bg-zinc-500/20 opacity-20 blur-xl transition-opacity duration-500 pointer-events-none ${isRecording ? 'opacity-100' : 'opacity-0'}`}></div>
                 <RecordButton
@@ -228,6 +219,24 @@ export default function TestMode() {
             <CardContent className="p-0">
               <div className="divide-y divide-border/50">
                 <div className="p-4 grid grid-cols-1 gap-4">
+                  <div className="flex items-center justify-between p-2 rounded-md bg-muted/30">
+                    <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Architecture</span>
+                    <span className="text-xs font-mono font-medium">Hybrid (WS+Room)</span>
+                  </div>
+                  <div className="flex items-center justify-between p-2 rounded-md bg-orange-500/10 border border-orange-500/20">
+                    <span className="text-xs font-semibold text-orange-600 dark:text-orange-400 uppercase tracking-wider">Real-time TAT</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="relative flex h-2 w-2">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-500 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-2 w-2 bg-orange-500"></span>
+                      </span>
+                      <span className="text-xs font-mono font-bold text-orange-700 dark:text-orange-300">
+                        {latency > 0
+                          ? (latency > 1000 ? `${(latency / 1000).toFixed(2)}s` : `${latency}ms`)
+                          : "~800ms"}
+                      </span>
+                    </div>
+                  </div>
                   <StatusBadge label="Frontend" status={frontendStatus} detail="Vite + React" />
                   <StatusBadge label="Backend API" status={backendStatus} detail="FastAPI" />
                   <StatusBadge label="LiveKit" status={livekitStatus} detail={roomName ? "Connected" : "Ready"} />
@@ -262,7 +271,7 @@ export default function TestMode() {
           </Card>
         </div>
 
-      </main>
-    </div>
+      </div>
+    </PageLayout>
   );
 }

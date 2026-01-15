@@ -4,10 +4,11 @@ import json
 import logging
 import signal
 import threading
+import time
 from dotenv import load_dotenv
 
 # LiveKit & Signal Processing
-from livekit import api, agents
+from livekit import api, agents, rtc
 from livekit.agents import JobContext, WorkerOptions, cli
 from livekit.plugins import silero
 import numpy as np
@@ -28,6 +29,8 @@ load_dotenv()
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("asr-worker")
+# Silence verbose AI logs
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
 # --- Configuration ---
 LIVEKIT_URL = os.getenv("LIVEKIT_URL")
@@ -147,11 +150,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio_base64 = data.get("data", "")
                     audio_bytes = base64.b64decode(audio_base64)
                     
-                    logger.info(f"🎵 Received audio chunk: {len(audio_bytes)} bytes")
+                    logger.info(f"[WS MODE] 🎵 Received audio chunk: {len(audio_bytes)} bytes")
                     
-                    # Skip chunks smaller than 40KB (likely incomplete/corrupt or too short)
-                    if len(audio_bytes) < 40000:
-                        logger.warning(f"⚠️ Skipping small audio chunk ({len(audio_bytes)} bytes) - likely incomplete or too short for accurate transcription")
+                    # Skip chunks smaller than 1KB (likely just header or silence)
+                    if len(audio_bytes) < 1000:
+                        logger.warning(f"⚠️ Skipping small audio chunk ({len(audio_bytes)} bytes)")
                         continue
                     
                     # Save audio chunk to temporary file
@@ -228,7 +231,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         segments, info = asr_engine.model.transcribe(
                             temp_wav_path,
                             beam_size=1,  # Fast decoding
-                            language="en",
+                            language=data.get("language", "en"),
                             vad_filter=True,
                             vad_parameters=dict(min_silence_duration_ms=500),
                             # SPEED OPTIMIZATIONS - disable quality checks that slow down processing
@@ -260,11 +263,11 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "turnaround_ms": turnaround_ms  # Time taken to process
                             }
                             
-                            logger.info(f"📤 Sending transcript: '{transcribed_text}' (processed in {turnaround_ms}ms)")
+                            logger.info(f"[WS MODE] 📤 Sending transcript: '{transcribed_text}' (processed in {turnaround_ms}ms)")
                             await websocket.send_json(transcript_response)
-                            logger.info("✅ Transcript sent successfully")
+                            logger.info("[WS MODE] ✅ Transcript sent successfully")
                         else:
-                            logger.info("🔇 No speech detected in audio chunk")
+                            logger.info("[WS MODE] 🔇 No speech detected in audio chunk")
                         
                         # Clean up temporary files
                         import os
@@ -326,39 +329,73 @@ class MedicalASR:
         full_text = " ".join([s.text for s in segments]).strip()
         return full_text
 
-# Global ASR instance
-asr_engine = None
+# Global ASR instance initialized on startup
+asr_engine = MedicalASR()
 
 async def entrypoint(ctx: JobContext):
     """
     Main LiveKit Agent Entrypoint.
-    Called when a new job (room connection) is assigned to this worker.
     """
-    global asr_engine
-    if not asr_engine:
-        asr_engine = MedicalASR()
-
-    logger.info(f"🚀 Agent connecting to room: {ctx.room.name}")
+    logger.info(f"[AGENT MODE] 🚀 Agent assigned to room: {ctx.room.name}")
     await ctx.connect()
-    logger.info(f"✅ Connected to room: {ctx.room.name}")
+    logger.info(f"[AGENT MODE] ✅ Connected. Participants: {len(ctx.room.remote_participants)}")
+    
+    # Store settings per participant (e.g. language)
+    participant_configs = {}
 
-    # Subscribe to all audio tracks from users
+    def handle_track(track, participant):
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info(f"[AGENT MODE] 🎤 Processing audio track {track.sid} from {participant.identity}")
+            asyncio.create_task(process_audio_track(ctx, track, participant, participant_configs))
+
+    @ctx.room.on("data_received")
+    def on_data_received(data: rtc.DataPacket):
+        if data.topic == "config":
+            try:
+                msg = json.loads(data.data)
+                if msg.get("type") == "config":
+                    identity = data.participant.identity
+                    lang = msg.get("language", "en")
+                    participant_configs[identity] = {"language": lang}
+                    logger.info(f"[AGENT MODE] ⚙️ Language set to '{lang}' for {identity}")
+            except Exception as e:
+                logger.error(f"[AGENT MODE] Error processing config: {e}")
+
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track, publication, participant):
-        if track.kind == "audio":
-            logger.info(f"🎤 Subscribed to audio from {participant.identity}")
-            asyncio.create_task(process_audio_track(ctx, track, participant))
+        handle_track(track, participant)
+
+    @ctx.room.on("track_published")
+    def on_track_published(publication, participant):
+        if publication.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info(f"[AGENT MODE] 📡 New track published: {publication.sid}. Subscribing...")
+            publication.set_subscribed(True)
+
+    # Scavenge for existing tracks (in case user joined before agent)
+    for participant in ctx.room.remote_participants.values():
+        for publication in participant.track_publications.values():
+            if publication.kind == rtc.TrackKind.KIND_AUDIO:
+                if publication.track:
+                    handle_track(publication.track, participant)
+                else:
+                    logger.info(f"[AGENT MODE] 🔍 Auto-subscribing to existing track {publication.sid}")
+                    publication.set_subscribed(True)
+
+    @ctx.room.on("participant_connected")
+    def on_participant_connected(participant):
+        logger.info(f"[AGENT MODE] 👤 Participant joined: {participant.identity}")
 
     # Wait for the job to close
     # ctx.wait_for_shutdown() is handled by the worker framework usually, 
     # but we can keep the coroutine alive if needed.
 
-async def process_audio_track(ctx: JobContext, track, participant):
+async def process_audio_track(ctx: JobContext, track, participant, participant_configs):
     """
     Reads audio frames from the track, buffers them, and runs ASR.
     """
     # Create an audio stream (yielding AudioFrames)
-    audio_stream = agents.utils.AudioStream(track)
+    # Force 16kHz for Whisper compatibility
+    audio_stream = rtc.AudioStream(track, sample_rate=16000)
     
     # We will accumulate audio data (PCM 16kHz mono)
     audio_buffer = bytearray()
@@ -366,44 +403,60 @@ async def process_audio_track(ctx: JobContext, track, participant):
     # Configuration
     SAMPLE_RATE = 16000
     BYTES_PER_SAMPLE = 2 # int16
-    BUFFER_SECONDS = 3.0 
+    BUFFER_SECONDS = 1.5 # Increased from 0.5s to 1.5s for better Whisper context
     BUFFER_SIZE_BYTES = int(SAMPLE_RATE * BYTES_PER_SAMPLE * BUFFER_SECONDS)
     
-    logger.info(f"🎧 Started processing audio for {participant.identity}")
+    logger.info(f"[AGENT MODE] 🎧 Started processing audio for {participant.identity}")
     
     # Transcription loop
-    async for frame in audio_stream:
-        # frame.data is the raw PCM bytes
+    frame_count = 0
+    async for event in audio_stream:
+        # event is an AudioFrameEvent
+        frame = event.frame
         audio_buffer.extend(frame.data.tobytes())
+        
+        frame_count += 1
+        if frame_count % 500 == 0:
+            logger.info(f"[AGENT MODE] 📊 Audio stream active (Participant: {participant.identity})")
         
         # If buffer is full enough, process it
         if len(audio_buffer) >= BUFFER_SIZE_BYTES:
-            # 1. Prepare chunks
-            # In a real VAD app, we would split on silence.
-            # Here for minimal viability, we transcribe the whole chunk.
-            
-            # Convert to numpy for faster-whisper (float32)
-            # 16-bit int -> float32
+            # 1. Extract and clear buffer always
             audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+            audio_buffer.clear()
             
-            # 2. Transcribe
-            # Run in executor to avoid blocking the async event loop
+            # Check Peak Volume
+            peak = np.abs(audio_np).max()
+            
+            # Skip AI processing if it's mostly silence
+            if peak < 0.01:
+                continue
+
+            logger.info(f"[AGENT MODE] 🔊 Processing chunk (Peak: {peak:.4f})")
+            
+            # 2. Transcribe in executor
             try:
+                def do_transcribe(data, lang):
+                    # ALL heavy lifting must stay in executor
+                    segments, _ = asr_engine.model.transcribe(
+                        data, 
+                        beam_size=1, 
+                        language=lang, 
+                        vad_filter=True, # Re-enabled now that peak is verified
+                        vad_parameters=dict(min_speech_duration_ms=100)
+                    )
+                    return " ".join([seg.text for seg in segments]).strip()
+
                 loop = asyncio.get_running_loop()
-                text = await loop.run_in_executor(
-                    None, 
-                    # Use a lambda or partial to pass arguments
-                    lambda: asr_engine.model.transcribe(audio_np, beam_size=1, language="en")[0]
-                )
-                
-                # 'text' is a generator of segments
-                full_transcription = " ".join([seg.text for seg in text]).strip()
+                # Get current language from configs
+                current_lang = participant_configs.get(participant.identity, {}).get("language", "en")
+                full_transcription = await loop.run_in_executor(None, do_transcribe, audio_np, current_lang)
                 
                 if full_transcription:
-                    logger.info(f"📝 Transcript [{participant.identity}]: {full_transcription}")
+                    # Boxed log for high visibility
+                    text_len = len(full_transcription)
+                    logger.info(f"\n╔{'═' * (text_len + 4)}╗\n║  {full_transcription}  ║\n╚{'═' * (text_len + 4)}╝\n")
                     
-                    # 3. Send back to frontend via Data Packet
-                    # The message format matches what the frontend expects
                     payload = json.dumps({
                         "type": "transcript",
                         "text": full_transcription,
@@ -414,16 +467,15 @@ async def process_audio_track(ctx: JobContext, track, participant):
                     
                     await ctx.room.local_participant.publish_data(
                         payload, 
-                        topic="transcription",
-                        reliable=True
+                        reliable=True,
+                        topic="transcription"
                     )
+                elif peak > 0.05:
+                    # Log if there was significant sound but no words detected
+                    logger.info(f"[AGENT MODE] 🔇 No speech found (Peak Volume: {peak:.4f})")
             
             except Exception as e:
-                logger.error(f"ASR Error: {e}")
-            
-            # Reset buffer usually, or sliding window.
-            # Simple approach: clear buffer
-            audio_buffer.clear()
+                logger.error(f"[AGENT MODE] ASR Execution failed: {e}")
 
 
 # --- Main Application Runner ---
