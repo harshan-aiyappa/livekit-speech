@@ -97,6 +97,7 @@ export default function WebSocketMode() {
                                 <RecordButton
                                     isRecording={isRecording}
                                     isConnecting={status === "connecting"}
+                                    onClick={handleToggleRecording}
                                 />
                             </div>
                             <div className="w-full space-y-4">
