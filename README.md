@@ -1,6 +1,7 @@
-# Vocalize - Speech Transcription App
+# 🎙️ Vocalize - Real-Time Speech Practice
+**Developed by Harshan Aiyappa**
 
-Real-time speech-to-text using Whisper AI
+![Status](https://img.shields.io/badge/Status-Production%20Ready-green) Whisper AI
 
 > ⚠️ **iOS Compatibility**: Current implementation may not work on iOS Safari.  
 > See [iOS Compatibility Guide](./docs/IOS_COMPATIBILITY.md) for solutions.

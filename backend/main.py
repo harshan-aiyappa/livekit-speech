@@ -77,6 +77,38 @@ async def create_token(req: TokenRequest):
 async def health():
     return {"status": "ok"}
 
+# Serve React Frontend (Production)
+from fastapi.staticfiles import StaticFiles
+import os
+
+# Serve React Frontend (Production)
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+
+# Specific path for assets first (Vite output usually has 'assets' folder)
+if os.path.exists("static/assets"):
+    app.mount("/assets", StaticFiles(directory="static/assets"), name="assets")
+
+# SPA Catch-All Route (Must be after API routes)
+# This serves index.html for any path not matched by API or assets
+@app.get("/{full_path:path}")
+async def serve_spa(full_path: str):
+    # Skip API routes (let them 404 if handled by FastAPI, or they are processed before this)
+    if full_path.startswith("api") or full_path.startswith("ws"):
+        raise HTTPException(status_code=404, detail="Not Found")
+    
+    # If file exists in static (e.g. favicon.ico), serve it
+    static_file = os.path.join("static", full_path)
+    if os.path.exists(static_file) and os.path.isfile(static_file):
+        return FileResponse(static_file)
+    
+    # Otherwise/Default: Serve index.html (React App)
+    index_file = os.path.join("static", "index.html")
+    if os.path.exists(index_file):
+        return FileResponse(index_file)
+    
+    return {"status": "Frontend not found (dev mode)"}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

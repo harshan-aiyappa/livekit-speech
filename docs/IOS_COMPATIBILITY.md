@@ -462,3 +462,5 @@ const fps = isIOS() ? 30 : 60;
 ---
 
 **Last Updated**: January 15, 2026
+
+**Prepared by**: Harshan Aiyappa

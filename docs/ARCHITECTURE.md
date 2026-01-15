@@ -15,13 +15,16 @@ The current implementation uses **BOTH** LiveKit and WebSocket connections:
 
 ### Components
 
-**Frontend:**
+**Frontend Structure:**
+![Component Flow](./images/component_flow.png)
+
 - `useLiveKit.ts`: Manages both LiveKit room and WebSocket
 - LiveKit Client: Creates room, publishes audio track
 - WebSocket: Sends audio chunks, receives transcripts
-- MediaRecorder: Captures audio in WebM format
 
-**Backend:**
+**Backend Protocol:**
+![WebSocket Protocol](./images/websocket_protocol.png)
+
 - FastAPI: Serves API and WebSocket endpoint
 - WebSocket Handler: Receives audio, processes with Whisper
 - Whisper Model: `base` model with CPU inference (INT8)
@@ -231,6 +234,8 @@ recorder.ondataavailable = (e) => ws.send(e.data);
 
 ### Current Metrics (Optimized)
 
+![Data Flow Timeline](./images/data_flow_diagram.png)
+
 | Metric | Value | Notes |
 |--------|-------|-------|
 | **Connection Setup** | ~3-5 seconds | LiveKit + WebSocket |
@@ -426,4 +431,4 @@ WebM (from browser) → FFmpeg → WAV (16kHz, mono) → Whisper
 
 **Document Version**: 1.0  
 **Last Updated**: January 15, 2026  
-**Author**: Development Team
+**Author**: Harshan Aiyappa

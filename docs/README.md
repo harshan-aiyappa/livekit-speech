@@ -1,6 +1,7 @@
-# Vocalize Documentation
+# 🎙️ Vocalize - Real-Time Speech Transcription
+**By Harshan Aiyappa**
 
-**Real-Time Speech Transcription Application**
+> A production-ready speech practice application using React, FastAPI, and OpenAI Whisper.
 
 ---
 
@@ -50,10 +51,12 @@ LIVEKIT_API_SECRET=your-secret
 
 ---
 
-## 🎯 Key Features
+## ✨ Features
 
-- ✅ **Real-time Speech Transcription** (Whisper base model)
-- ✅ **Persistent Connection** (instant record/stop)
+![User Journey](./images/user_flow.png)
+
+- 🎙️ **Real-time Speech Transcription** using OpenAI's Whisper model
+- ⚡ **Optimized Performance** (2-5s latency on CPU)onnection** (instant record/stop)
 - ✅ **Modern UI** (monochrome theme, animations)
 - ✅ **Performance Metrics** (turnaround time tracking)
 - ✅ **Audio Visualization** (40-bar animated visualizer)
