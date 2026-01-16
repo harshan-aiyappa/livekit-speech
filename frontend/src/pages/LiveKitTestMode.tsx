@@ -133,10 +133,10 @@ export default function LiveKitTestMode() {
         >
             {/* System Verification Onboarding */}
             <SystemCheckModal
-                isOpen={introOpen}
-                onClose={() => setIntroOpen(false)}
+                isOpen={isModalOpen}
+                onClose={() => setIsModalOpen(false)}
                 onExit={() => setLocation("/")}
-                steps={checks}
+                steps={checkSteps}
                 title="Agent Core System Check"
             />
 
