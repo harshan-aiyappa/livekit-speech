@@ -7,10 +7,17 @@ import threading
 import time
 from dotenv import load_dotenv
 
-# LiveKit & Signal Processing
-from livekit import api, agents, rtc
-from livekit.agents import JobContext, WorkerOptions, cli
-from livekit.plugins import silero
+# LiveKit & Signal Processing  
+try:
+    from livekit import api, agents, rtc
+    from livekit.agents import JobContext, WorkerOptions, cli
+    # from livekit.plugins import silero # Unused and causes import error
+    LIVEKIT_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️ LiveKit DLL not available: {e}")
+    print("⚠️ Running in WebSocket-ONLY mode (Recommended for single-user apps)")
+    LIVEKIT_AVAILABLE = False
+
 import numpy as np
 
 # ASR
@@ -45,8 +52,9 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 API_PORT = int(os.getenv("API_PORT", 8000))
 
 if not all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]):
-    logger.error("❌ LiveKit credentials missing. Check .env file.")
-    exit(1)
+    if LIVEKIT_AVAILABLE:
+        logger.warning("⚠️ LiveKit credentials missing, but continuing in WebSocket-only mode")
+    # Don't exit - WebSocket mode works without LiveKit
 
 # --- FastAPI Setup (Token Server) ---
 app = FastAPI(title="LiveKit Voice Agent API")
@@ -66,7 +74,10 @@ class TokenRequest(BaseModel):
 async def create_token(req: TokenRequest):
     """
     Generates a LiveKit access token for the frontend client.
-    """
+    """  
+    if not LIVEKIT_AVAILABLE:
+        raise HTTPException(status_code=503, detail="LiveKit unavailable - use WebSocket mode")
+    
     token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
         .with_identity(req.participant_name) \
         .with_name(req.participant_name) \
@@ -84,7 +95,7 @@ async def create_token(req: TokenRequest):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "livekit_available": LIVEKIT_AVAILABLE, "websocket_mode": True}
 
 # Serve React Frontend (Production)
 from fastapi.staticfiles import StaticFiles
@@ -126,7 +137,7 @@ async def websocket_endpoint(websocket: WebSocket):
     Receives base64-encoded audio chunks and returns transcriptions.
     """
     await websocket.accept()
-    logger.info("🔌 WebSocket client connected")
+    logger.info("🔌 [MODE: WEBSOCKET-DIRECT] Client connected - Ready for transcription")
     
     # Initialize ASR engine and session buffer
     global asr_engine
@@ -172,6 +183,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         # Only take the last 15 seconds to keep it fast
                         if len(audio) > 15000:
                             audio = audio[-15000:]
+                        
+                        # 🛡️ Anti-Hallucination: Check Volume (Energy)
+                        # If audio is too quiet (silence/hiss), don't send to Whisper
+                        if audio.dBFS < -40:
+                             # logger.info(f"[WS] 🔇 Signal too weak ({audio.dBFS:.1f} dB), skipping")
+                             continue
                             
                         audio = audio.set_channels(1).set_frame_rate(16000)
                         
@@ -193,14 +210,16 @@ async def websocket_endpoint(websocket: WebSocket):
                                 vad_filter=True,
                                 no_speech_threshold=0.6
                             )
-                            return " ".join([s.text for s in segments]).strip()
+                            text = " ".join([s.text for s in segments]).strip()
+                            return asr_engine.filter_hallucinations(text)
 
                         loop = asyncio.get_running_loop()
+                        lang = data.get("language", "en")
                         transcribed_text = await loop.run_in_executor(
                             None, 
                             run_transcription, 
                             temp_wav_path, 
-                            data.get("language", "en")
+                            lang
                         )
                         
                         # Cleanup temp file
@@ -213,7 +232,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             process_end = time.time()
                             turnaround_ms = int((process_end - process_start) * 1000)
                             
-                            logger.info(f"[WS MODE] 📤 Transcript: '{transcribed_text}' ({turnaround_ms}ms)")
+                            logger.info(f"[MODE: WEBSOCKET] [{lang}] 📤 Transcript: '{transcribed_text}' ({turnaround_ms}ms)")
                             await websocket.send_json({
                                 "type": "transcript",
                                 "text": transcribed_text,
@@ -246,11 +265,30 @@ class MedicalASR:
     def __init__(self):
         logger.info("⏳ Loading Whisper (base) model...")
         # Run on CPU with int8 quantization for speed/compatibility
-        self.model = WhisperModel("base", device="cpu", compute_type="int8")
-        logger.info("✅ Whisper loaded.")
+        # Upgraded to 'small' for better accuracy (vs base)
+        try:
+            self.model = WhisperModel("small", device="cpu", compute_type="int8")
+        except:
+             logger.warning("⚠️ Failed to load 'small' model, falling back to 'base'")
+             self.model = WhisperModel("base", device="cpu", compute_type="int8")
+             
+        logger.info(f"✅ Whisper model loaded.")
         
-        # VAD State (Simple Energy-based or WebRTCVAD)
-        # We will use simple energy/VAD logic in the processing loop
+        # Hallucination Blocklist (Common subtitle artifacts)
+        self.HALLUCINATIONS = {
+            "Thank you.", "Thanks for watching.", "You", 
+            "MBC", "Amara.org", "Subtitles by", "Subtitles",
+            "Copyright", "©"
+        }
+    
+    def filter_hallucinations(self, text: str) -> str:
+        if not text: return ""
+        if text.strip() in self.HALLUCINATIONS:
+            return ""
+        # If text starts with "Thank you" and is very short, ignore
+        if text.strip().startswith("Thank you") and len(text) < 15:
+            return ""
+        return text
         
     async def transcribe_buffer(self, audio_data: np.ndarray, sample_rate: int):
         """
@@ -271,7 +309,7 @@ class MedicalASR:
 # Global ASR instance initialized on startup
 asr_engine = MedicalASR()
 
-async def entrypoint(ctx: JobContext):
+async def entrypoint(ctx: 'JobContext'):
     """
     Main LiveKit Agent Entrypoint.
     """
@@ -328,7 +366,7 @@ async def entrypoint(ctx: JobContext):
     # ctx.wait_for_shutdown() is handled by the worker framework usually, 
     # but we can keep the coroutine alive if needed.
 
-async def process_audio_track(ctx: JobContext, track, participant, participant_configs):
+async def process_audio_track(ctx: 'JobContext', track, participant, participant_configs):
     """
     Reads audio frames from the track, buffers them, and runs ASR.
     """
@@ -345,7 +383,7 @@ async def process_audio_track(ctx: JobContext, track, participant, participant_c
     BUFFER_SECONDS = 1.5 # Increased from 0.5s to 1.5s for better Whisper context
     BUFFER_SIZE_BYTES = int(SAMPLE_RATE * BYTES_PER_SAMPLE * BUFFER_SECONDS)
     
-    logger.info(f"[AGENT MODE] 🎧 Started processing audio for {participant.identity}")
+    logger.info(f"[MODE: LIVEKIT-AGENT] 🎧 Started processing audio for {participant.identity}")
     
     # Transcription loop
     frame_count = 0
@@ -387,7 +425,8 @@ async def process_audio_track(ctx: JobContext, track, participant, participant_c
                         # If Whisper is < 60% sure it's speech, ignore it
                         no_speech_threshold=0.6
                     )
-                    return " ".join([seg.text for seg in segments]).strip()
+                    text = " ".join([seg.text for seg in segments]).strip()
+                    return asr_engine.filter_hallucinations(text)
 
                 loop = asyncio.get_running_loop()
                 # Get current language from configs
@@ -397,6 +436,7 @@ async def process_audio_track(ctx: JobContext, track, participant, participant_c
                 if full_transcription:
                     # Boxed log for high visibility
                     text_len = len(full_transcription)
+                    logger.info(f"[MODE: LIVEKIT-AGENT] 🗣️  Detected Speech (Lang: {current_lang})")
                     logger.info(f"\n╔{'═' * (text_len + 4)}╗\n║  {full_transcription}  ║\n╚{'═' * (text_len + 4)}╝\n")
                     
                     payload = json.dumps({
@@ -428,32 +468,41 @@ def run_fastapi():
     asyncio.run(server.serve())
 
 def run_worker():
-    # Initialize the worker
-    # Note: cli.run_app is blocking, so we need to run it carefully or use dev runner
-    # For this hybrid setup (FastAPI + Worker in one process), we start FastAPI in a thread
-    # and run the Worker in the main thread (or vice versa).
-    # LiveKit Agents usually want main thread for signals.
-    
     # Start FastAPI in background thread
     t = threading.Thread(target=run_fastapi, daemon=True)
     t.start()
     
-    # Run Agent
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    if LIVEKIT_AVAILABLE:
+        # Run Agent
+        cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    else:
+        # Just keep alive for WebSocket server
+        logger.info("✅ WebSocket server running. LiveKit Agent disabled.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
 
 if __name__ == "__main__":
-    # Check for arguments to decide mode, or just run both for 'dev'
-    print(f"🚀 Starting Hybrid Server (API on {API_PORT} + LiveKit Worker)...")
+    # Check credentials to decide mode
+    has_creds = all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET])
+    should_run_agent = LIVEKIT_AVAILABLE and has_creds
+
+    mode = "Hybrid (LiveKit + WebSocket)" if should_run_agent else "WebSocket-Only"
+    print(f"🚀 Starting {mode} Server (API on {API_PORT})...")
     
-    # We use a slight hack to run both: 
-    # run_app() blocks, so we launch API first.
-    t = threading.Thread(target=run_fastapi, daemon=True)
-    t.start()
-    
-    # Run the worker listener
-    # Default to 'dev' mode if no command provided
-    import sys
-    if len(sys.argv) == 1:
-        sys.argv.append("dev")
+    if should_run_agent:
+        # Run with LiveKit Agent
+        t = threading.Thread(target=run_fastapi, daemon=True)
+        t.start()
         
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+        import sys
+        if len(sys.argv) == 1:
+            sys.argv.append("dev")
+            
+        cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    else:
+        # WebSocket-only mode
+        print("✅ LiveKit disabled. Running WebSocket server for transcription.")
+        run_fastapi()

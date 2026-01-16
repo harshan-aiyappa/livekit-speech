@@ -8,6 +8,8 @@ import {
 import type { ConnectionStatus, TranscriptSegment } from "@shared/schema";
 import { apiRequest } from "@/lib/queryClient";
 
+import { useToast } from "@/hooks/use-toast";
+
 interface UseLiveKitReturn {
   status: ConnectionStatus;
   isRecording: boolean;
@@ -20,9 +22,12 @@ interface UseLiveKitReturn {
   error: string | null;
   mode: "live" | null;
   isInitializing: boolean;
+  language: string;
+  setLanguage: (lang: string) => void;
 }
 
 export function useLiveKit(): UseLiveKitReturn {
+  const { toast } = useToast();
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const [isRecording, setIsRecording] = useState(false);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);

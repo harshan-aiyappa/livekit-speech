@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { Link } from "wouter";
 import { ArrowLeft } from "lucide-react";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { VantaBackground } from "@/components/VantaBackground";
 
 interface PageLayoutProps {
     children: React.ReactNode;
@@ -37,6 +38,9 @@ export function PageLayout({ children, title, subtitle, backLink = "/", actions 
                     className="absolute bottom-0 right-0 w-[500px] h-[500px] bg-purple-500/5 rounded-full blur-[80px] mix-blend-multiply dark:mix-blend-screen"
                 />
             </div>
+
+            {/* 1.5. Vanta JS Background */}
+            <VantaBackground />
 
             {/* 2. Glassmorphic Header */}
             <motion.header

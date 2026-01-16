@@ -1,9 +1,12 @@
+
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useToast } from "@/hooks/use-toast";
 import { TranscriptSegment } from "@/shared/schema";
 
 export function useWebSocketOnly() {
     const { toast } = useToast();
+    const isMountedRef = useRef(true);
+
     const [status, setStatus] = useState<"idle" | "connecting" | "connected" | "disconnected" | "error">("idle");
     const [isRecording, setIsRecording] = useState(false);
     const [segments, setSegments] = useState<TranscriptSegment[]>([]);
@@ -30,15 +33,20 @@ export function useWebSocketOnly() {
 
     const connect = useCallback(() => {
         try {
-            setStatus("connecting");
+            if (isMountedRef.current) setStatus("connecting");
             const ws = new WebSocket(WS_URL);
 
             ws.onopen = () => {
-                setStatus("connected");
-                toast({ title: "Connected", description: "Direct WebSocket connection established." });
+                if (isMountedRef.current) {
+                    setStatus("connected");
+                    toast({ title: "Connected", description: "Direct WebSocket connection established." });
+                } else {
+                    ws.close();
+                }
             };
 
             ws.onmessage = (event) => {
+                if (!isMountedRef.current) return;
                 try {
                     const data = JSON.parse(event.data);
 
@@ -65,19 +73,21 @@ export function useWebSocketOnly() {
             };
 
             ws.onclose = () => {
-                setStatus("disconnected");
+                if (isMountedRef.current) setStatus("disconnected");
             };
 
             ws.onerror = (e) => {
                 console.error("WS Error", e);
-                setStatus("error");
-                toast({ title: "Connection Error", description: "Is the backend running?", variant: "destructive" });
+                if (isMountedRef.current) {
+                    setStatus("error");
+                    toast({ title: "Connection Error", description: "Is the backend running?", variant: "destructive" });
+                }
             };
 
             socketRef.current = ws;
 
         } catch (e) {
-            setStatus("error");
+            if (isMountedRef.current) setStatus("error");
         }
     }, [toast]);
 
@@ -89,10 +99,18 @@ export function useWebSocketOnly() {
 
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+            // CRITICAL CHECK: If component unmounted while waiting for permission/device
+            if (!isMountedRef.current) {
+                console.log("[Direct] Component unmounted, stopping new stream immediately.");
+                stream.getTracks().forEach(t => t.stop());
+                return;
+            }
+
             streamRef.current = stream;
 
             // Audio Level Logic
-            const audioContext = new AudioContext();
+            const audioContext = new AudioContext(); // Should be cleaned up but context per connection is okayish
             const source = audioContext.createMediaStreamSource(stream);
             const analyzer = audioContext.createAnalyser();
             analyzer.fftSize = 256;
@@ -100,6 +118,7 @@ export function useWebSocketOnly() {
             analyzerRef.current = analyzer;
 
             const updateLevel = () => {
+                if (!isMountedRef.current) return;
                 const dataArray = new Uint8Array(analyzer.frequencyBinCount);
                 analyzer.getByteFrequencyData(dataArray);
                 const avg = dataArray.reduce((p, c) => p + c, 0) / dataArray.length;
@@ -129,13 +148,15 @@ export function useWebSocketOnly() {
                 }
             };
 
-            recorder.start(500); // 500ms chunks for a good balance of latency and stability
+            recorder.start(500); // 500ms chunks
             setIsRecording(true);
             setLatency(0);
 
         } catch (e) {
             console.error("Mic Error", e);
-            toast({ title: "Microphone Error", description: "Access denied or not found.", variant: "destructive" });
+            if (isMountedRef.current) {
+                toast({ title: "Microphone Error", description: "Access denied or not found.", variant: "destructive" });
+            }
         }
     }, [toast]);
 
@@ -145,20 +166,27 @@ export function useWebSocketOnly() {
         }
         if (streamRef.current) {
             streamRef.current.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
         }
         if (animationFrameRef.current) {
             cancelAnimationFrame(animationFrameRef.current);
         }
-        setIsRecording(false);
-        setAudioLevel(0);
+        if (isMountedRef.current) {
+            setIsRecording(false);
+            setAudioLevel(0);
+        }
     }, []);
 
     // Disconnect on unmount
     useEffect(() => {
+        isMountedRef.current = true;
         // Connect on mount
         connect();
 
         return () => {
+            isMountedRef.current = false;
+            console.log("[Direct] 🧹 Unmounting - Cleanup");
+
             // Cleanup Socket
             socketRef.current?.close();
 
@@ -167,7 +195,12 @@ export function useWebSocketOnly() {
                 mediaRecorderRef.current.stop();
             }
             if (streamRef.current) {
-                streamRef.current.getTracks().forEach(track => track.stop());
+                console.log("[Direct] 🛑 Stopping Microphone Tracks");
+                streamRef.current.getTracks().forEach(track => {
+                    track.stop();
+                    console.log(`[Direct] Track ${track.label} stopped`);
+                });
+                streamRef.current = null;
             }
             if (animationFrameRef.current) {
                 cancelAnimationFrame(animationFrameRef.current);

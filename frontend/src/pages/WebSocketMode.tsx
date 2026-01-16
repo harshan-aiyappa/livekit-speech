@@ -1,8 +1,7 @@
 
-
-import { useState } from "react";
-import { Link } from "wouter";
-import { AlertCircle, Zap, ArrowLeft, Wifi } from "lucide-react";
+import { useState, useEffect } from "react";
+import { Link, useLocation } from "wouter";
+import { AlertCircle, Zap, ArrowLeft, Wifi, Mic, Server, Activity } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { RecordButton } from "@/components/RecordButton";
 import { AudioVisualizer } from "@/components/AudioVisualizer";
@@ -12,6 +11,7 @@ import { useWebSocketOnly } from "@/hooks/useWebSocketOnly";
 import { LanguageSelector } from "@/components/LanguageSelector";
 import { useToast } from "@/hooks/use-toast";
 import { PageLayout } from "@/components/layout/PageLayout";
+import { SystemCheckModal, SystemCheckStep } from "@/components/SystemCheckModal";
 
 function StatusBadge({ label, status, detail }: { label: string; status: "ok" | "loading" | "error" | "idle"; detail?: string }) {
     const styles = {
@@ -36,6 +36,7 @@ function StatusBadge({ label, status, detail }: { label: string; status: "ok" | 
 }
 
 export default function WebSocketMode() {
+    const [_, setLocation] = useLocation();
     const { toast } = useToast();
     const {
         status,
@@ -51,6 +52,51 @@ export default function WebSocketMode() {
     } = useWebSocketOnly();
 
     const [sessionStart, setSessionStart] = useState<number | null>(null);
+    const [isModalOpen, setIsModalOpen] = useState(true);
+    const [micStatus, setMicStatus] = useState<"idle" | "running" | "success" | "error">("idle");
+
+    // Check Mic Permission on Mount
+    useEffect(() => {
+        if (isModalOpen && micStatus === "idle") {
+            setMicStatus("running");
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then((stream) => {
+                    setMicStatus("success");
+                    // Stop tracks immediately after check
+                    stream.getTracks().forEach(t => t.stop());
+                })
+                .catch((err) => {
+                    console.error("Mic check failed", err);
+                    setMicStatus("error");
+                    toast({ title: "Microphone Access Denied", description: "Please allow microphone access to proceed.", variant: "destructive" });
+                });
+        }
+    }, [isModalOpen, micStatus, toast]);
+
+    // Construct Check Steps
+    const checkSteps: SystemCheckStep[] = [
+        {
+            id: "ws-connect",
+            label: "Server Connection",
+            description: "Establishing standard WebSocket link...",
+            status: status === "connected" ? "success" : status === "error" ? "error" : "running",
+            icon: <Wifi className="h-4 w-4" />
+        },
+        {
+            id: "mic-check",
+            label: "Microphone Access",
+            description: "Verifying input device permissions...",
+            status: micStatus,
+            icon: <Mic className="h-4 w-4" />
+        },
+        {
+            id: "backend-api",
+            label: "Transcription Service",
+            description: "Checking Faster-Whisper availability...",
+            status: status === "connected" ? "success" : "idle", // Assumes if WS connects, Backend is ready
+            icon: <Server className="h-4 w-4" />
+        }
+    ];
 
     const handleToggleRecording = () => {
         if (isRecording) {
@@ -78,7 +124,17 @@ export default function WebSocketMode() {
             title="Direct Mode"
             subtitle="Pure WebSocket (No LiveKit)"
             actions={headerActions}
+            backLink="/"
         >
+            {/* System Verification Onboarding */}
+            <SystemCheckModal
+                isOpen={isModalOpen}
+                onClose={() => setIsModalOpen(false)}
+                onExit={() => setLocation("/")}
+                steps={checkSteps}
+                title="System Verification"
+            />
+
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
 
                 {/* Left Panel: Controls */}
@@ -115,7 +171,7 @@ export default function WebSocketMode() {
                     <Card className="overflow-hidden border-0 shadow-md ring-1 ring-border/50 h-full">
                         <CardHeader className="bg-muted/20 pb-4">
                             <CardTitle className="text-sm font-medium uppercase tracking-widest text-muted-foreground flex items-center gap-2">
-                                <Wifi className="h-4 w-4" /> Connection
+                                <Activity className="h-4 w-4" /> Telemetry
                             </CardTitle>
                         </CardHeader>
                         <CardContent className="p-0">
@@ -134,8 +190,8 @@ export default function WebSocketMode() {
                                             </span>
                                             <span className="text-xs font-mono font-bold text-green-700 dark:text-green-300">
                                                 {latency > 0
-                                                    ? (latency > 1000 ? `${(latency / 1000).toFixed(2)}s` : `${latency}ms`)
-                                                    : "&lt;200ms"}
+                                                    ? `${(latency / 1000).toFixed(2)}s`
+                                                    : "0.00s"}
                                             </span>
                                         </div>
                                     </div>

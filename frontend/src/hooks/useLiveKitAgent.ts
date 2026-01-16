@@ -1,3 +1,4 @@
+
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
     Room,
@@ -14,6 +15,7 @@ import { TranscriptSegment } from "@/shared/schema";
 // LiveKit Agent Hook
 export function useLiveKitAgent() {
     const { toast } = useToast();
+    const isMountedRef = useRef(true);
 
     // Stable Room Instance
     const [room] = useState(() => new Room({
@@ -33,14 +35,27 @@ export function useLiveKitAgent() {
     const localTrackRef = useRef<LocalAudioTrack | null>(null);
     const isConnectingRef = useRef(false);
 
-    // Cleanup on unmount
+    // Cleanup on unmount - Ensure everything is killed
     useEffect(() => {
+        isMountedRef.current = true;
         return () => {
-            console.log("[Agent] 🧹 Disconnecting room");
+            isMountedRef.current = false;
+            console.log("[Agent] 🧹 Unmounting component - cleanup started");
+
+            // 1. Mark connecting as false to abort pending operations
             isConnectingRef.current = false;
-            room.disconnect();
+
+            // 2. Stop Local Track (Microphone) DIRECTLY
             if (localTrackRef.current) {
+                console.log("[Agent] 🛑 Stopping local microphone track");
                 localTrackRef.current.stop();
+                localTrackRef.current = null;
+            }
+
+            // 3. Disconnect Room
+            if (room && room.state !== ConnectionState.Disconnected) {
+                console.log("[Agent] 🔌 Disconnecting LiveKit room");
+                room.disconnect();
             }
         };
     }, [room]);
@@ -49,7 +64,8 @@ export function useLiveKitAgent() {
     useEffect(() => {
         if (!room) return;
 
-        const handleData = (payload: Uint8Array, participant: RemoteParticipant | undefined, kind: DataPacket_Kind, topic?: string) => {
+        const handleData = (payload: Uint8Array, participant?: RemoteParticipant, kind?: DataPacket_Kind, topic?: string) => {
+            if (!isMountedRef.current) return;
             const strData = new TextDecoder().decode(payload);
             try {
                 const data = JSON.parse(strData);
@@ -78,6 +94,7 @@ export function useLiveKitAgent() {
         };
 
         const handleDisconnect = () => {
+            if (!isMountedRef.current) return;
             console.log("[Agent] 🔌 Disconnected");
             setStatus("disconnected");
             setIsRecording(false);
@@ -99,15 +116,10 @@ export function useLiveKitAgent() {
     useEffect(() => {
         let interval: NodeJS.Timeout;
         if (isRecording && localTrackRef.current) {
-            // Simple internal monitoring or setup AudioContext
-            // For simplicity, we can mock or use a separate analyser
-            // LiveKit tracks have .mediaStreamTrack
-
-            // Let's attach an analyser to the local track
             // Fix: Create MediaStream from the track
             const mediaStream = new MediaStream([localTrackRef.current.mediaStreamTrack]);
 
-            const audioContext = new AudioContext();
+            const audioContext = new AudioContext(); // Note: Should probably be managed globally to avoid limit
             const source = audioContext.createMediaStreamSource(mediaStream);
 
             const analyser = audioContext.createAnalyser();
@@ -116,11 +128,18 @@ export function useLiveKitAgent() {
             const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
             interval = setInterval(() => {
+                if (!isMountedRef.current) return;
                 analyser.getByteFrequencyData(dataArray);
                 const sum = dataArray.reduce((acc, val) => acc + val, 0);
                 const avg = sum / dataArray.length;
                 setAudioLevel(Math.min(1, avg / 128)); // Normalize roughly
             }, 50);
+
+            // Clean up AudioContext on unmount/stop
+            return () => {
+                clearInterval(interval);
+                audioContext.close();
+            }
         }
         return () => {
             if (interval) clearInterval(interval);
@@ -137,10 +156,11 @@ export function useLiveKitAgent() {
 
         try {
             isConnectingRef.current = true;
-            setStatus("connecting");
+            if (isMountedRef.current) setStatus("connecting");
+
             const participantName = "user-" + Math.floor(Math.random() * 1000);
             const uniqueRoomName = `agent-room-${Math.floor(Date.now() / 1000).toString(36)}`;
-            setRoomName(uniqueRoomName);
+            if (isMountedRef.current) setRoomName(uniqueRoomName);
 
             // Fetch Token
             const response = await fetch("/api/livekit/token", {
@@ -151,11 +171,14 @@ export function useLiveKitAgent() {
             const data = await response.json();
 
             if (!data.token) throw new Error("No token received");
+            if (!isMountedRef.current) return; // EXIT if unmounted
 
             console.log("[Agent] Signal URL:", data.livekit_url);
             // Connect to Room
             await room.connect(data.livekit_url, data.token);
             console.log("[Agent] ✅ Room connected:", uniqueRoomName);
+
+            if (!isMountedRef.current) { room.disconnect(); return; }
 
             // Pre-publish track (muted) for instant start/stop
             if (!localTrackRef.current) {
@@ -165,6 +188,14 @@ export function useLiveKitAgent() {
                     echoCancellation: true,
                     autoGainControl: true,
                 });
+
+                // CRITICAL CHECK: If component unmounted while creating track
+                if (!isMountedRef.current) {
+                    console.log("[Agent] 🛑 Component unmounted, stopping newly created track");
+                    track.stop();
+                    return;
+                }
+
                 // Start muted
                 await track.mute();
                 localTrackRef.current = track;
@@ -181,14 +212,18 @@ export function useLiveKitAgent() {
                 { reliable: true, topic: "config" }
             );
 
-            setStatus("connected");
-            setError(null);
+            if (isMountedRef.current) {
+                setStatus("connected");
+                setError(null);
+            }
 
         } catch (err: any) {
             console.error("[Agent] Connection error:", err);
-            setError(err.message);
-            setStatus("error");
-            toast({ title: "Connection Failed", description: err.message, variant: "destructive" });
+            if (isMountedRef.current) {
+                setError(err.message);
+                setStatus("error");
+                toast({ title: "Connection Failed", description: err.message, variant: "destructive" });
+            }
         } finally {
             isConnectingRef.current = false;
         }
@@ -208,13 +243,13 @@ export function useLiveKitAgent() {
                 { reliable: true, topic: "config" }
             );
 
-            setIsRecording(true);
+            if (isMountedRef.current) setIsRecording(true);
             console.log("[Agent] 🎤 Capture active (Language:", language, ")");
         } catch (err: any) {
             console.error("[Agent] Failed to unmute:", err);
-            toast({ title: "Mic Error", description: "Could not activate microphone", variant: "destructive" });
+            if (isMountedRef.current) toast({ title: "Mic Error", description: "Could not activate microphone", variant: "destructive" });
         }
-    }, [toast]);
+    }, [toast, language]);
 
     // 3. Stop Recording = Mute Track
     const stopRecording = useCallback(async () => {
@@ -222,8 +257,10 @@ export function useLiveKitAgent() {
         try {
             console.log("[Agent] ⏸️ Stopping capture (muting)...");
             await localTrackRef.current.mute();
-            setIsRecording(false);
-            setAudioLevel(0);
+            if (isMountedRef.current) {
+                setIsRecording(false);
+                setAudioLevel(0);
+            }
         } catch (err) {
             console.error("[Agent] Failed to mute:", err);
         }

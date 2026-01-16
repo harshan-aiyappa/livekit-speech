@@ -1,9 +1,9 @@
 
 import { useState, useEffect } from "react";
-import { CheckCircle, AlertCircle, Server } from "lucide-react";
+import { useLocation } from "wouter";
+import { CheckCircle, AlertCircle, Server, Mic, Activity, Box } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { ThemeToggle } from "@/components/ThemeToggle"; // Kept for PageLayout usage if needed internally, though PageLayout handles it.
-import { StatusIndicator } from "@/components/StatusIndicator"; // Check if this is compatible
+import { StatusIndicator } from "@/components/StatusIndicator";
 import { RecordButton } from "@/components/RecordButton";
 import { AudioVisualizer } from "@/components/AudioVisualizer";
 import { SessionTimer } from "@/components/SessionTimer";
@@ -12,6 +12,7 @@ import { LanguageSelector } from "@/components/LanguageSelector";
 import { useLiveKitAgent } from "@/hooks/useLiveKitAgent";
 import { useToast } from "@/hooks/use-toast";
 import { PageLayout } from "@/components/layout/PageLayout";
+import { SystemCheckModal, SystemCheckStep } from "@/components/SystemCheckModal";
 
 function StatusBadge({ label, status, detail }: { label: string; status: "ok" | "loading" | "error" | "idle"; detail?: string }) {
     const styles = {
@@ -36,6 +37,7 @@ function StatusBadge({ label, status, detail }: { label: string; status: "ok" | 
 }
 
 export default function LiveKitTestMode() {
+    const [_, setLocation] = useLocation();
     const { toast } = useToast();
     const {
         status,
@@ -53,11 +55,31 @@ export default function LiveKitTestMode() {
     } = useLiveKitAgent();
 
     const [sessionStart, setSessionStart] = useState<number | null>(null);
+    const [isModalOpen, setIsModalOpen] = useState(true);
+    const [micStatus, setMicStatus] = useState<"idle" | "running" | "success" | "error">("idle");
 
     // Auto-connect on mount
     useEffect(() => {
         connect();
     }, [connect]);
+
+    // Check Mic Permission on Mount
+    useEffect(() => {
+        if (isModalOpen && micStatus === "idle") {
+            setMicStatus("running");
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then((stream) => {
+                    setMicStatus("success");
+                    // Stop tracks immediately after check
+                    stream.getTracks().forEach(t => t.stop());
+                })
+                .catch((err) => {
+                    console.error("Mic check failed", err);
+                    setMicStatus("error");
+                    toast({ title: "Microphone Access Denied", description: "Please allow microphone access to proceed.", variant: "destructive" });
+                });
+        }
+    }, [isModalOpen, micStatus, toast]);
 
     const handleToggleRecording = () => {
         if (isRecording) {
@@ -78,12 +100,46 @@ export default function LiveKitTestMode() {
         </div>
     );
 
+    // Construct Check Steps
+    const checkSteps: SystemCheckStep[] = [
+        {
+            id: "room-connect",
+            label: "LiveKit Room",
+            description: "Connecting to real-time session...",
+            status: status === "connected" ? "success" : status === "error" ? "error" : "running",
+            icon: <Box className="h-4 w-4" />
+        },
+        {
+            id: "mic-check",
+            label: "Microphone Access",
+            description: "Verifying input device permissions...",
+            status: micStatus,
+            icon: <Mic className="h-4 w-4" />
+        },
+        {
+            id: "agent-ready",
+            label: "Agent Availability",
+            description: "Waiting for AI Agent to join...",
+            status: status === "connected" ? "success" : "idle",
+            icon: <Server className="h-4 w-4" />
+        }
+    ];
+
     return (
         <PageLayout
             title="Agent Mode"
             subtitle="Pure LiveKit (WebRTC)"
             actions={headerActions}
         >
+            {/* System Verification Onboarding */}
+            <SystemCheckModal
+                isOpen={introOpen}
+                onClose={() => setIntroOpen(false)}
+                onExit={() => setLocation("/")}
+                steps={checks}
+                title="Agent Core System Check"
+            />
+
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
 
                 {/* Left Panel: Controls & Status */}
@@ -149,8 +205,8 @@ export default function LiveKitTestMode() {
                                             </span>
                                             <span className="text-xs font-mono font-bold text-blue-700 dark:text-blue-300">
                                                 {latency > 0
-                                                    ? (latency > 1000 ? `${(latency / 1000).toFixed(2)}s` : `${latency}ms`)
-                                                    : "~400ms"}
+                                                    ? `${(latency / 1000).toFixed(2)}s`
+                                                    : "0.00s"}
                                             </span>
                                         </div>
                                     </div>

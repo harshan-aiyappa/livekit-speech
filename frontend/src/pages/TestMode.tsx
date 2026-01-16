@@ -1,6 +1,7 @@
 
 import { useState, useEffect } from "react";
-import { CheckCircle, AlertCircle, Server } from "lucide-react";
+import { useLocation } from "wouter";
+import { CheckCircle, AlertCircle, Server, Mic, Box, Activity } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { StatusIndicator } from "@/components/StatusIndicator";
 import { RecordButton } from "@/components/RecordButton";
@@ -12,6 +13,7 @@ import { LanguageSelector } from "@/components/LanguageSelector";
 import { useToast } from "@/hooks/use-toast";
 import { useQuery } from "@tanstack/react-query";
 import { PageLayout } from "@/components/layout/PageLayout";
+import { SystemCheckModal, SystemCheckStep } from "@/components/SystemCheckModal";
 
 function StatusBadge({ label, status, detail }: { label: string; status: "ok" | "loading" | "error" | "idle"; detail?: string }) {
   const styles = {
@@ -36,6 +38,7 @@ function StatusBadge({ label, status, detail }: { label: string; status: "ok" | 
 }
 
 export default function TestMode() {
+  const [_, setLocation] = useLocation();
   const { toast } = useToast();
   const {
     status,
@@ -56,6 +59,10 @@ export default function TestMode() {
   const [prevStatus, setPrevStatus] = useState(status);
   const [wsConnected, setWsConnected] = useState(false);
 
+  // System Check State
+  const [isModalOpen, setIsModalOpen] = useState(true);
+  const [micStatus, setMicStatus] = useState<"idle" | "running" | "success" | "error">("idle");
+
   const { data: healthData, isError: healthError, isLoading: healthLoading } = useQuery<{ status: string; timestamp: string; whisper_loaded: boolean }>({
     queryKey: ["/api/health"],
     refetchInterval: 10000,
@@ -68,6 +75,24 @@ export default function TestMode() {
       setWsConnected(false);
     }
   }, [status]);
+
+  // Check Mic Permission on Mount
+  useEffect(() => {
+    if (isModalOpen && micStatus === "idle") {
+      setMicStatus("running");
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then((stream) => {
+          setMicStatus("success");
+          // Stop tracks immediately after check
+          stream.getTracks().forEach(t => t.stop());
+        })
+        .catch((err) => {
+          console.error("Mic check failed", err);
+          setMicStatus("error");
+          toast({ title: "Microphone Access Denied", description: "Please allow microphone access to proceed.", variant: "destructive" });
+        });
+    }
+  }, [isModalOpen, micStatus, toast]);
 
   useEffect(() => {
     if (healthData?.status === "ok" && prevStatus !== status) {
@@ -141,12 +166,46 @@ export default function TestMode() {
     </div>
   );
 
+  // Construct Check Steps
+  const checkSteps: SystemCheckStep[] = [
+    {
+      id: "hybrid-connect",
+      label: "Room Connection",
+      description: "Joining LiveKit session...",
+      status: status === "connected" ? "success" : status === "error" ? "error" : "running",
+      icon: <Box className="h-4 w-4" />
+    },
+    {
+      id: "mic-check",
+      label: "Microphone Access",
+      description: "Verifying input device permissions...",
+      status: micStatus,
+      icon: <Mic className="h-4 w-4" />
+    },
+    {
+      id: "health-check",
+      label: "Backend Service",
+      description: "Checking API health...",
+      status: backendStatus === "ok" ? "success" : backendStatus === "error" ? "error" : "running",
+      icon: <Server className="h-4 w-4" />
+    }
+  ];
+
   return (
     <PageLayout
       title="Hybrid Test Mode"
       subtitle="LiveKit Room + Custom WebSocket"
       actions={headerActions}
     >
+      {/* System Verification Onboarding */}
+      <SystemCheckModal
+        isOpen={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        onExit={() => setLocation("/")}
+        steps={checkSteps}
+        title="Hybrid System Check"
+      />
+
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
 
         {/* Left Panel: Controls */}
@@ -232,8 +291,8 @@ export default function TestMode() {
                       </span>
                       <span className="text-xs font-mono font-bold text-orange-700 dark:text-orange-300">
                         {latency > 0
-                          ? (latency > 1000 ? `${(latency / 1000).toFixed(2)}s` : `${latency}ms`)
-                          : "~800ms"}
+                          ? `${(latency / 1000).toFixed(2)}s`
+                          : "0.00s"}
                       </span>
                     </div>
                   </div>

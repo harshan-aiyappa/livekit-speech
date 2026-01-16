@@ -4,6 +4,7 @@ import { Mic, ArrowRight, Sparkles, Server, Activity } from "lucide-react";
 import { CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { SpotlightCard } from "@/components/ui/spotlight-card";
+import { VantaBackground } from "@/components/VantaBackground";
 import { motion } from "framer-motion";
 
 export default function Home() {
@@ -29,28 +30,8 @@ export default function Home() {
     <div className="min-h-screen w-full bg-background relative overflow-hidden flex flex-col font-sans selection:bg-primary/20">
 
       {/* Dynamic Aurora Background */}
-      <div className="absolute inset-0 w-full h-full pointer-events-none overflow-hidden z-0">
-        <motion.div
-          animate={{
-            x: [-100, 100, -100],
-            y: [-50, 50, -50],
-            opacity: [0.3, 0.6, 0.3],
-            scale: [1, 1.2, 1]
-          }}
-          transition={{ duration: 18, repeat: Infinity, ease: "linear" }}
-          className="absolute top-[-20%] left-[-10%] w-[800px] h-[800px] bg-primary/10 rounded-full blur-[120px] mix-blend-multiply dark:mix-blend-screen"
-        />
-        <motion.div
-          animate={{
-            x: [100, -100, 100],
-            y: [50, -50, 50],
-            opacity: [0.3, 0.5, 0.3],
-            scale: [1.2, 1, 1.2]
-          }}
-          transition={{ duration: 25, repeat: Infinity, ease: "linear" }}
-          className="absolute bottom-[-10%] right-[-10%] w-[600px] h-[600px] bg-purple-500/10 rounded-full blur-[100px] mix-blend-multiply dark:mix-blend-screen"
-        />
-      </div>
+      {/* Dynamic Vanta Background */}
+      <VantaBackground />
 
       {/* Header */}
       <motion.header

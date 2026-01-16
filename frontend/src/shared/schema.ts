@@ -14,4 +14,4 @@ export interface LiveKitTokenResponse {
     identity: string;
 }
 
-export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
+export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error" | "idle";
