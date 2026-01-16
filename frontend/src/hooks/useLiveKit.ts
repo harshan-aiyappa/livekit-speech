@@ -174,6 +174,7 @@ export function useLiveKit(): UseLiveKitReturn {
                 confidence: data.confidence,
                 speaker: data.speaker,
                 isFinal: data.isFinal ?? true,
+                turnaround_ms: data.turnaround_ms
               };
 
               setSegments((prev) => {
