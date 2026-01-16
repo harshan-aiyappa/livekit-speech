@@ -83,7 +83,8 @@ export function useLiveKitAgent() {
                         timestamp: data.timestamp || Date.now(),
                         text: data.text,
                         isFinal: true,
-                        speaker: "Agent"
+                        speaker: "Agent",
+                        turnaround_ms: data.turnaround_ms
                     };
 
                     setSegments(prev => [...prev, segment]);

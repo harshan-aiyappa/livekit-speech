@@ -63,7 +63,8 @@ export function useWebSocketOnly() {
                             timestamp: Date.now(),
                             text: data.text,
                             isFinal: true,
-                            speaker: "User"
+                            speaker: "User",
+                            turnaround_ms: data.turnaround_ms
                         };
                         setSegments(prev => [...prev, segment]);
                     }

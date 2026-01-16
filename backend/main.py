@@ -147,6 +147,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # Buffer to accumulate WebM chunks (must keep the header at the start)
     session_audio_buffer = bytearray()
     last_process_time = time.time()
+    processing_task = None # Track async inference status
     
     # Send status to client
     await websocket.send_json({
@@ -161,91 +162,76 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if data.get("type") == "audio_chunk":
                 try:
-                    process_start = time.time()
+                    # process_start = time.time() # Moved inside task
                     audio_base64 = data.get("data", "")
                     audio_bytes = base64.b64decode(audio_base64)
                     
                     # Accumulate bytes
                     session_audio_buffer.extend(audio_bytes)
-                    
-                    # Process every ~0.8 second or so to keep UI snappy
-                    last_process_time = time.time()
-                    
-                    # Safeguard: if buffer is too big (>1MB) without a header, something is wrong
-                    if len(session_audio_buffer) > 1024 * 1024:
-                        logger.warning("[WS MODE] ⚠️ Buffer overflow, resetting...")
-                        session_audio_buffer = bytearray(audio_bytes) # Start fresh with current chunk
-                    
-                    try:
-                        # Convert the FULL accumulated buffer to WAV
-                        audio = AudioSegment.from_file(io.BytesIO(session_audio_buffer), format="webm")
-                        
-                        # Only take the last 5 seconds to keep it fast (Optimized from 15s)
-                        if len(audio) > 5000:
-                            audio = audio[-5000:]
-                        
-                        # 🛡️ Anti-Hallucination: Check Volume (Energy)
-                        # If audio is too quiet (silence/hiss), don't send to Whisper
-                        if audio.dBFS < -40:
-                             # logger.info(f"[WS] 🔇 Signal too weak ({audio.dBFS:.1f} dB), skipping")
-                             continue
-                            
-                        audio = audio.set_channels(1).set_frame_rate(16000)
-                        
-                        # Export to WAV in memory
-                        wav_buffer = io.BytesIO()
-                        audio.export(wav_buffer, format="wav")
-                        wav_buffer.seek(0)
-                        
-                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
-                            temp_wav.write(wav_buffer.read())
-                            temp_wav_path = temp_wav.name
-                        
-                        # Transcribe in executor
-                        def run_transcription(path, lang):
-                            segments, _ = asr_engine.model.transcribe(
-                                path,
-                                beam_size=1,
-                                language=lang,
-                                vad_filter=True,
-                                no_speech_threshold=0.6
-                            )
-                            text = " ".join([s.text for s in segments]).strip()
-                            return asr_engine.filter_hallucinations(text)
 
-                        loop = asyncio.get_running_loop()
+                    # 🛡️ Truncate Buffer: Keep only last 10s (approx 32KB/s * 10 = 320KB)
+                    # WebM bitrate varies, but safe upper bound 500KB prevents slow loading
+                    if len(session_audio_buffer) > 500 * 1024:
+                         session_audio_buffer = session_audio_buffer[-(500 * 1024):]
+                    
+                    # Non-Blocking Processing Logic
+                    # If previous task is still running, SKIP inference for this chunk
+                    # This prevents the "60s latency spiral"
+                    if processing_task is None or processing_task.done():
+                        # Clone buffer for the task
+                        buffer_copy =  session_audio_buffer[:] 
                         lang = data.get("language", "en")
-                        transcribed_text = await loop.run_in_executor(
-                            None, 
-                            run_transcription, 
-                            temp_wav_path, 
-                            lang
-                        )
+                        timestamp = data.get("timestamp", 0)
                         
-                        # Cleanup temp file
-                        try:
-                            os.unlink(temp_wav_path)
-                        except:
-                            pass
+                        async def task_wrapper(buf, l, ts):
+                            loop = asyncio.get_running_loop()
+                            t_start = time.time()
+                            
+                            try:
+                                # Prepare WAV in memory
+                                audio = AudioSegment.from_file(io.BytesIO(buf), format="webm")
+                                # Use last 5s
+                                if len(audio) > 5000: audio = audio[-5000:]
+                                
+                                if audio.dBFS < -40: return
+                                
+                                audio = audio.set_channels(1).set_frame_rate(16000)
+                                wav_io = io.BytesIO()
+                                audio.export(wav_io, format="wav")
+                                wav_io.seek(0)
+                                
+                                # Run Inference
+                                def run_transcription():
+                                    segments, _ = asr_engine.model.transcribe(
+                                        wav_io, beam_size=1, language=l, vad_filter=True,
+                                        vad_parameters=dict(min_speech_duration_ms=250),
+                                        no_speech_threshold=0.6
+                                    )
+                                    text = " ".join([s.text for s in segments]).strip()
+                                    return asr_engine.filter_hallucinations(text)
+                                    
+                                transcribed_text = await loop.run_in_executor(None, run_transcription)
+                                
+                                if transcribed_text:
+                                    t_end = time.time()
+                                    tat = int((t_end - t_start) * 1000)
+                                    logger.info(f"[MODE: WEBSOCKET] 📤 Transcript: '{transcribed_text}' ({tat}ms)")
+                                    try:
+                                        await websocket.send_json({
+                                            "type": "transcript",
+                                            "text": transcribed_text,
+                                            "timestamp": ts,
+                                            "isFinal": True,
+                                            "turnaround_ms": tat,
+                                            "id": f"chunk-{int(time.time()*1000)}"
+                                        })
+                                    except:
+                                        pass # Socket might be closed
+                            except Exception as e:
+                                logger.error(f"Task Error: {e}")
 
-                        if transcribed_text:
-                            process_end = time.time()
-                            turnaround_ms = int((process_end - process_start) * 1000)
-                            
-                            logger.info(f"[MODE: WEBSOCKET] [{lang}] 📤 Transcript: '{transcribed_text}' ({turnaround_ms}ms)")
-                            await websocket.send_json({
-                                "type": "transcript",
-                                "text": transcribed_text,
-                                "timestamp": data.get("timestamp", 0),
-                                "isFinal": True,
-                                "turnaround_ms": turnaround_ms,
-                                "id": f"chunk-{int(time.time()*1000)}"
-                            })
-                            
-                    except Exception as conversion_error:
-                        logger.error(f"❌ Conversion error: {conversion_error}")
-                        # Don't send error to client for every chunk, just log it
-                    
+                        processing_task = asyncio.create_task(task_wrapper(buffer_copy, lang, timestamp))
+
                 except Exception as e:
                     logger.error(f"❌ Error processing audio chunk: {e}")
     
@@ -412,6 +398,7 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
             logger.info(f"[AGENT MODE] 🔊 Sound detected (Peak: {peak:.4f})")
             
             # 2. Transcribe in executor
+            process_start = time.time()
             try:
                 def do_transcribe(data, lang):
                     # ALL heavy lifting must stay in executor
@@ -434,9 +421,12 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
                 full_transcription = await loop.run_in_executor(None, do_transcribe, audio_np, current_lang)
                 
                 if full_transcription:
+                    process_end = time.time()
+                    turnaround_ms = int((process_end - process_start) * 1000)
+
                     # Boxed log for high visibility
                     text_len = len(full_transcription)
-                    logger.info(f"[MODE: LIVEKIT-AGENT] 🗣️  Detected Speech (Lang: {current_lang})")
+                    logger.info(f"[MODE: LIVEKIT-AGENT] 🗣️  Detected Speech (Lang: {current_lang}) TAT: {turnaround_ms}ms")
                     logger.info(f"\n╔{'═' * (text_len + 4)}╗\n║  {full_transcription}  ║\n╚{'═' * (text_len + 4)}╝\n")
                     
                     payload = json.dumps({
@@ -444,7 +434,8 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
                         "text": full_transcription,
                         "isFinal": True,
                         "timestamp": int(time.time() * 1000),
-                        "participantId": participant.identity
+                        "participantId": participant.identity,
+                        "turnaround_ms": turnaround_ms
                     })
                     
                     await ctx.room.local_participant.publish_data(
