@@ -1,7 +1,7 @@
 
 # 🏗️ System Architecture
 
-**Project**: Vocalis - Multi-Modal Speech Platform  
+**Project**: Lingotran Vocalis - Multi-Modal Speech Platform  
 **Date**: January 16, 2026  
 **Status**: Implemented & Production Ready
 

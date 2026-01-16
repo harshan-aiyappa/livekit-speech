@@ -1,5 +1,5 @@
 
-# 🎙️ Vocalis - Real-Time Speech AI Platform
+# 🎙️ Lingotran Vocalis - Real-Time Speech AI Platform
 
 **Advanced Hybrid Speech-to-Text System using LiveKit, WebSockets, and Faster-Whisper.**
 

@@ -50,7 +50,7 @@ export default function Home() {
               Lingotran
             </span>
             <span className="text-[9px] font-medium text-muted-foreground tracking-widest uppercase mt-0.5">
-              Nexus
+              Vocalis
             </span>
           </div>
         </div>
@@ -79,7 +79,7 @@ export default function Home() {
             </div>
 
             <h1 className="text-4xl md:text-5xl font-black tracking-tighter text-transparent bg-clip-text bg-gradient-to-br from-foreground via-foreground to-foreground/60 drop-shadow-sm py-1">
-              Lingotran Nexus.
+              Lingotran Vocalis.
             </h1>
 
             <p className="text-sm md:text-base text-muted-foreground max-w-lg mx-auto leading-relaxed font-light">
