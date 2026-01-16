@@ -209,8 +209,13 @@ async def websocket_endpoint(websocket: WebSocket):
                                     )
                                     text = " ".join([s.text for s in segments]).strip()
                                     return asr_engine.filter_hallucinations(text)
-                                    
-                                transcribed_text = await loop.run_in_executor(None, run_transcription)
+                                
+                                try:
+                                    transcribed_text = await loop.run_in_executor(None, run_transcription)
+                                except RuntimeError as e:
+                                    if "shutdown" in str(e).lower():
+                                        return  # Silently ignore shutdown errors
+                                    raise
                                 
                                 if transcribed_text:
                                     t_end = time.time()
@@ -227,6 +232,9 @@ async def websocket_endpoint(websocket: WebSocket):
                                         })
                                     except:
                                         pass # Socket might be closed
+                            except RuntimeError as e:
+                                if "shutdown" not in str(e).lower():
+                                    logger.error(f"Task Error: {e}")
                             except Exception as e:
                                 logger.error(f"Task Error: {e}")
 
