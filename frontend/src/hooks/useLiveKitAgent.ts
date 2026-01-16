@@ -34,6 +34,7 @@ export function useLiveKitAgent() {
 
     const localTrackRef = useRef<LocalAudioTrack | null>(null);
     const isConnectingRef = useRef(false);
+    const sessionStartRef = useRef<number>(0);
 
     // Cleanup on unmount - Ensure everything is killed
     useEffect(() => {
@@ -80,7 +81,7 @@ export function useLiveKitAgent() {
 
                     const segment: TranscriptSegment = {
                         id: data.id || crypto.randomUUID(),
-                        timestamp: data.timestamp || Date.now(),
+                        timestamp: data.timestamp || (Date.now() - sessionStartRef.current),
                         text: data.text,
                         isFinal: true,
                         speaker: "Agent",
@@ -235,6 +236,7 @@ export function useLiveKitAgent() {
         if (!localTrackRef.current) return;
         try {
             console.log("[Agent] 🚀 Starting capture (unmuting)...");
+            sessionStartRef.current = Date.now();
             await localTrackRef.current.unmute();
 
             // Send config again to ensure agent has correct language

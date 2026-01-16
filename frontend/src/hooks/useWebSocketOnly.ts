@@ -25,6 +25,7 @@ export function useWebSocketOnly() {
     const streamRef = useRef<MediaStream | null>(null);
     const analyzerRef = useRef<AnalyserNode | null>(null);
     const animationFrameRef = useRef<number>();
+    const sessionStartRef = useRef<number>(0);
 
     // Use the same backend WS endpoint, but without Livekit room coordination
     // Use relative path so it works in production/dev identically
@@ -60,7 +61,7 @@ export function useWebSocketOnly() {
 
                         const segment: TranscriptSegment = {
                             id: data.id || crypto.randomUUID(),
-                            timestamp: Date.now(),
+                            timestamp: Date.now() - sessionStartRef.current,
                             text: data.text,
                             isFinal: true,
                             speaker: "User",
@@ -99,6 +100,7 @@ export function useWebSocketOnly() {
         }
 
         try {
+            sessionStartRef.current = Date.now();
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
             // CRITICAL CHECK: If component unmounted while waiting for permission/device
