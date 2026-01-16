@@ -180,9 +180,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         # Convert the FULL accumulated buffer to WAV
                         audio = AudioSegment.from_file(io.BytesIO(session_audio_buffer), format="webm")
                         
-                        # Only take the last 15 seconds to keep it fast
-                        if len(audio) > 15000:
-                            audio = audio[-15000:]
+                        # Only take the last 5 seconds to keep it fast (Optimized from 15s)
+                        if len(audio) > 5000:
+                            audio = audio[-5000:]
                         
                         # 🛡️ Anti-Hallucination: Check Volume (Energy)
                         # If audio is too quiet (silence/hiss), don't send to Whisper
@@ -263,7 +263,7 @@ class MedicalASR:
     Manages the faster-whisper model and VAD for transcription
     """
     def __init__(self):
-        logger.info("⏳ Loading Whisper (base) model...")
+        logger.info("⏳ Loading Whisper (small) model...")
         # Run on CPU with int8 quantization for speed/compatibility
         # Upgraded to 'small' for better accuracy (vs base)
         try:
@@ -380,7 +380,7 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
     # Configuration
     SAMPLE_RATE = 16000
     BYTES_PER_SAMPLE = 2 # int16
-    BUFFER_SECONDS = 1.5 # Increased from 0.5s to 1.5s for better Whisper context
+    BUFFER_SECONDS = 1.0 # Reduced from 1.5s to 1.0s for faster TAT (Tradeoff: Context)
     BUFFER_SIZE_BYTES = int(SAMPLE_RATE * BYTES_PER_SAMPLE * BUFFER_SECONDS)
     
     logger.info(f"[MODE: LIVEKIT-AGENT] 🎧 Started processing audio for {participant.identity}")
