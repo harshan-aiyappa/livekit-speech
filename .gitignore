@@ -92,3 +92,4 @@ backend/htmlcov/
 backend/.coverage
 
 # Whisper downloads (models auto-download to ~/.cache/huggingface/)
+!docs/images/**/*.png
