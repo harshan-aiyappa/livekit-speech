@@ -7,7 +7,25 @@
 
 ---
 
+## 📊 System Overview
+
+![System Architecture](./images/system_architecture.png)
+
+*Complete 3-layer architecture: Frontend (React + TypeScript) → Communication (WebSocket + LiveKit) → Backend (FastAPI + Whisper)*
+
+---
+
+## 🔄 Transcription Modes
+
+![Mode Comparison](./images/mode_comparison.png)
+
+*Choose from 3 flexible modes: Direct Stream (WebSocket), Agent Core (LiveKit), or Hybrid Node (Best of Both)*
+
+---
+
 ### 1. Agent Mode (LiveKit WebRTC)
+
+![Agent Mode Flow](./images/agent_mode.png)
 ```mermaid
 graph LR
     User[📱 User Device] -- WebRTC Audio --> LiveKit[📡 LiveKit Server];
@@ -27,6 +45,9 @@ graph LR
 *   **Features:** Built-in VAD context, interruption handling, and robust networking (packet loss concealment).
 
 ### 2. Direct Mode (WebSocket)
+
+![Direct Mode Flow](./images/direct_mode.png)
+
 **The Lightweight P2P**
 ```mermaid
 graph LR

@@ -10,9 +10,17 @@
 
 ---
 
+## 📊 System Architecture
+
+![System Architecture](./docs/images/system_architecture.png)
+
+---
+
 ## 🚀 Overview
 
 Vocalis is a high-performance speech recognition practice platform designed for real-time accuracy and low latency. It supports three distinct architectural modes to demonstrate different ASR strategies:
+
+![Mode Comparison](./docs/images/mode_comparison.png)
 
 1.  **Agent Mode (Recommended):** Uses LiveKit WebRTC Data Channels for ultra-low latency (<300ms) and robust connectivity.
 2.  **Direct Mode (WebSocket):** Pure P2P-style WebSocket streaming for simple, server-direct transcription.
@@ -21,6 +29,8 @@ Vocalis is a high-performance speech recognition practice platform designed for 
 ---
 
 ## ✨ Features
+
+![Features Overview](./docs/images/features_overview.png)
 
 ### 🎧 Core Capabilities
 - **Real-time Transcription:** Powered by `faster-whisper` (Small model, int8 quantized).

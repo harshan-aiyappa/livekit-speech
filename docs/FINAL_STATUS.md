@@ -157,6 +157,8 @@ WS   /ws                  - WebSocket transcription
 
 ## 🏗️ Current Architecture
 
+![System Architecture](./images/system_architecture.png)
+
 ### **Frontend Structure:**
 ```
 frontend/
