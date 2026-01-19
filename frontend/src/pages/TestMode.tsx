@@ -1,9 +1,8 @@
 
 import { useState, useEffect } from "react";
 import { useLocation } from "wouter";
-import { CheckCircle, AlertCircle, Server, Mic, Box, Activity } from "lucide-react";
+import { CheckCircle, AlertCircle, Server, Mic, Box, Activity, Zap } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { StatusIndicator } from "@/components/StatusIndicator";
 import { RecordButton } from "@/components/RecordButton";
 import { AudioVisualizer } from "@/components/AudioVisualizer";
 import { SessionTimer } from "@/components/SessionTimer";
@@ -15,27 +14,7 @@ import { useQuery } from "@tanstack/react-query";
 import { PageLayout } from "@/components/layout/PageLayout";
 import { SystemCheckModal, SystemCheckStep } from "@/components/SystemCheckModal";
 
-function StatusBadge({ label, status, detail }: { label: string; status: "ok" | "loading" | "error" | "idle"; detail?: string }) {
-  const styles = {
-    ok: "bg-zinc-900 dark:bg-zinc-100 opacity-100",
-    loading: "bg-zinc-400 animate-pulse",
-    error: "bg-zinc-500",
-    idle: "bg-zinc-200 dark:bg-zinc-800",
-  };
-
-  return (
-    <div className="flex items-center gap-3 p-2 rounded-md hover:bg-muted/50 transition-colors" data-testid={`status-${label.toLowerCase().replace(/\s/g, '-')}`}>
-      <span className="relative flex h-2.5 w-2.5">
-        <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${styles[status]} ${status === 'idle' ? 'hidden' : ''}`}></span>
-        <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${styles[status]}`}></span>
-      </span>
-      <div className="flex flex-col">
-        <span className="font-medium text-xs uppercase tracking-wider text-muted-foreground">{label}</span>
-        {detail && <span className="text-sm font-semibold">{detail}</span>}
-      </div>
-    </div>
-  );
-}
+// StatusBadge Removed (Dead Code)
 
 export default function TestMode() {
   const [_, setLocation] = useLocation();
@@ -160,9 +139,40 @@ export default function TestMode() {
   const livekitStatus = status === "connected" ? "ok" : status === "connecting" ? "loading" : status === "error" ? "error" : "idle";
   const websocketStatus = wsConnected ? "ok" : isRecording ? "loading" : "idle";
 
+  // Compact Top Status Bar
+  const TopStatusBar = () => (
+    <div className="hidden md:flex items-center gap-3 mr-4">
+      {/* Architecture */}
+      <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700">
+        <Server className="h-3.5 w-3.5 text-blue-500" />
+        <span className="text-xs font-medium text-muted-foreground">Hybrid</span>
+      </div>
+
+      {/* TAT / Latency */}
+      <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700">
+        <Activity className="h-3.5 w-3.5 text-orange-500" />
+        <span className="text-xs font-mono font-medium">
+          {latency > 0 ? `${(latency / 1000).toFixed(2)}s` : "0.00s"}
+        </span>
+      </div>
+
+      {/* Connection Status */}
+      <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full border ${status === 'connected'
+        ? "bg-green-500/10 border-green-500/20 text-green-600 dark:text-green-400"
+        : status === 'connecting'
+          ? "bg-yellow-500/10 border-yellow-500/20 text-yellow-600 dark:text-yellow-400"
+          : "bg-zinc-100 dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-muted-foreground"
+        }`}>
+        <div className={`h-1.5 w-1.5 rounded-full ${status === 'connected' ? "bg-green-500" : status === 'connecting' ? "bg-yellow-500" : "bg-zinc-400"
+          }`} />
+        <span className="text-xs font-medium capitalize">{status}</span>
+      </div>
+    </div>
+  );
+
   const headerActions = (
-    <div className="flex items-center gap-2">
-      <StatusIndicator status={status} roomName={roomName ?? undefined} />
+    <div className="flex items-center">
+      <TopStatusBar />
     </div>
   );
 
@@ -188,6 +198,13 @@ export default function TestMode() {
       description: "Checking API health...",
       status: backendStatus === "ok" ? "success" : backendStatus === "error" ? "error" : "running",
       icon: <Server className="h-4 w-4" />
+    },
+    {
+      id: "ai-model",
+      label: "AI Neural Engine",
+      description: whisperStatus === "ok" ? "Faster-Whisper Ready" : "Loading Model...",
+      status: whisperStatus === "ok" ? "success" : "running",
+      icon: <Zap className="h-4 w-4" />
     }
   ];
 
@@ -246,7 +263,7 @@ export default function TestMode() {
                   </div>
 
                   {/* Animated Bar Visualizer */}
-                  <AudioVisualizer isActive={isRecording} audioLevel={audioLevel} />
+                  <AudioVisualizer isActive={isRecording || status === "connected"} audioLevel={audioLevel} />
                 </div>
               </div>
 
@@ -265,44 +282,6 @@ export default function TestMode() {
                   {error}
                 </div>
               )}
-            </CardContent>
-          </Card>
-
-          {/* System Status */}
-          <Card className="overflow-hidden border-0 shadow-md ring-1 ring-border/50 h-full">
-            <CardHeader className="bg-muted/20 pb-4">
-              <CardTitle className="text-sm font-medium uppercase tracking-widest text-muted-foreground flex items-center gap-2">
-                <Server className="h-4 w-4" /> System Health
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="p-0">
-              <div className="divide-y divide-border/50">
-                <div className="p-4 grid grid-cols-1 gap-4">
-                  <div className="flex items-center justify-between p-2 rounded-md bg-muted/30">
-                    <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Architecture</span>
-                    <span className="text-xs font-mono font-medium">Hybrid (WS+Room)</span>
-                  </div>
-                  <div className="flex items-center justify-between p-2 rounded-md bg-orange-500/10 border border-orange-500/20">
-                    <span className="text-xs font-semibold text-orange-600 dark:text-orange-400 uppercase tracking-wider">Real-time TAT</span>
-                    <div className="flex items-center gap-1.5">
-                      <span className="relative flex h-2 w-2">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-500 opacity-75"></span>
-                        <span className="relative inline-flex rounded-full h-2 w-2 bg-orange-500"></span>
-                      </span>
-                      <span className="text-xs font-mono font-bold text-orange-700 dark:text-orange-300">
-                        {latency > 0
-                          ? `${(latency / 1000).toFixed(2)}s`
-                          : "0.00s"}
-                      </span>
-                    </div>
-                  </div>
-                  <StatusBadge label="Frontend" status={frontendStatus} detail="Vite + React" />
-                  <StatusBadge label="Backend API" status={backendStatus} detail="FastAPI" />
-                  <StatusBadge label="LiveKit" status={livekitStatus} detail={roomName ? "Connected" : "Ready"} />
-                  <StatusBadge label="Speech Engine" status={whisperStatus} detail="Whisper" />
-                  <StatusBadge label="Realtime" status={websocketStatus} detail={wsConnected ? "Active" : "Standard"} />
-                </div>
-              </div>
             </CardContent>
           </Card>
         </div>

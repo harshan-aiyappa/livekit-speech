@@ -35,6 +35,7 @@ export function useLiveKitAgent() {
     const localTrackRef = useRef<LocalAudioTrack | null>(null);
     const isConnectingRef = useRef(false);
     const sessionStartRef = useRef<number>(0);
+    const [isTrackReady, setIsTrackReady] = useState(false);
 
     // Cleanup on unmount - Ensure everything is killed
     useEffect(() => {
@@ -81,7 +82,8 @@ export function useLiveKitAgent() {
 
                     const segment: TranscriptSegment = {
                         id: data.id || crypto.randomUUID(),
-                        timestamp: data.timestamp || (Date.now() - sessionStartRef.current),
+                        // Fix Timestamp: Use relative time from session start
+                        timestamp: data.timestamp ? (data.timestamp - sessionStartRef.current) : (Date.now() - sessionStartRef.current),
                         text: data.text,
                         isFinal: true,
                         speaker: "Agent",
@@ -115,38 +117,40 @@ export function useLiveKitAgent() {
     }, [room]);
 
     // Audio Level Monitoring (Local)
+    // Audio Level Monitoring (Local) - Visualizer
     useEffect(() => {
-        let interval: NodeJS.Timeout;
-        if (isRecording && localTrackRef.current) {
-            // Fix: Create MediaStream from the track
-            const mediaStream = new MediaStream([localTrackRef.current.mediaStreamTrack]);
+        if (!localTrackRef.current) return;
 
-            const audioContext = new AudioContext(); // Note: Should probably be managed globally to avoid limit
-            const source = audioContext.createMediaStreamSource(mediaStream);
+        // Setup Audio Context for Visualizer
+        const audioContext = new AudioContext();
+        const mediaStream = new MediaStream([localTrackRef.current.mediaStreamTrack]);
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
 
-            const analyser = audioContext.createAnalyser();
-            analyser.fftSize = 256;
-            source.connect(analyser);
-            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        let animationFrameId: number;
 
-            interval = setInterval(() => {
-                if (!isMountedRef.current) return;
-                analyser.getByteFrequencyData(dataArray);
-                const sum = dataArray.reduce((acc, val) => acc + val, 0);
-                const avg = sum / dataArray.length;
-                setAudioLevel(Math.min(1, avg / 128)); // Normalize roughly
-            }, 50);
+        const updateLevel = () => {
+            if (!isMountedRef.current) return;
+            analyser.getByteFrequencyData(dataArray);
+            const sum = dataArray.reduce((acc, val) => acc + val, 0);
+            const avg = sum / dataArray.length;
+            // Normalize: 0-255 -> 0-1. Standard sensitivity boost (avg / 128)
+            setAudioLevel(Math.min(1, avg / 128));
 
-            // Clean up AudioContext on unmount/stop
-            return () => {
-                clearInterval(interval);
-                audioContext.close();
-            }
-        }
-        return () => {
-            if (interval) clearInterval(interval);
+            animationFrameId = requestAnimationFrame(updateLevel);
         };
-    }, [isRecording]);
+
+        // Start loop
+        updateLevel();
+
+        return () => {
+            cancelAnimationFrame(animationFrameId);
+            audioContext.close();
+        };
+    }, [isTrackReady]); // Re-run when track is ready
 
 
     // 1. Get Token & Connect & Publish (Ready state)
@@ -198,13 +202,11 @@ export function useLiveKitAgent() {
                     return;
                 }
 
-                // Start muted
-                await track.mute();
+                // Keep Unmuted for Visualizer, but Don't Publish yet (Privacy)
                 localTrackRef.current = track;
+                setIsTrackReady(true); // Trigger visualizer effect
 
-                console.log("[Agent] 📤 Publishing track (muted)...");
-                await room.localParticipant.publishTrack(track);
-                console.log("[Agent] ✅ Mic ready (waiting for toggle)");
+                console.log("[Agent] ✅ Mic ready (Unpublished / Standby)");
             }
 
             // Send initial config
@@ -231,13 +233,21 @@ export function useLiveKitAgent() {
         }
     }, [room, toast]);
 
-    // 2. Start Recording = Unmute Track
+    // 2. Start Recording = Publish Track
     const startRecording = useCallback(async () => {
         if (!localTrackRef.current) return;
         try {
-            console.log("[Agent] 🚀 Starting capture (unmuting)...");
+            console.log("[Agent] 🚀 Starting capture (Publishing)...");
+
+            // Notify Backend (Privacy Audit)
+            fetch("/api/status/mic", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ status: "active", mode: "agent" })
+            }).catch(() => console.warn("Failed to log mic status"));
+
             sessionStartRef.current = Date.now();
-            await localTrackRef.current.unmute();
+            await room.localParticipant.publishTrack(localTrackRef.current);
 
             // Send config again to ensure agent has correct language
             const configPayload = JSON.stringify({ type: "config", language });
@@ -249,17 +259,26 @@ export function useLiveKitAgent() {
             if (isMountedRef.current) setIsRecording(true);
             console.log("[Agent] 🎤 Capture active (Language:", language, ")");
         } catch (err: any) {
-            console.error("[Agent] Failed to unmute:", err);
+            console.error("[Agent] Failed to publish:", err);
             if (isMountedRef.current) toast({ title: "Mic Error", description: "Could not activate microphone", variant: "destructive" });
         }
-    }, [toast, language]);
+    }, [toast, language, room]);
 
-    // 3. Stop Recording = Mute Track
+    // 3. Stop Recording = Unpublish Track
     const stopRecording = useCallback(async () => {
         if (!localTrackRef.current) return;
         try {
-            console.log("[Agent] ⏸️ Stopping capture (muting)...");
-            await localTrackRef.current.mute();
+            console.log("[Agent] ⏸️ Stopping capture (Unpublishing)...");
+
+            // Notify Backend (Privacy Audit)
+            fetch("/api/status/mic", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ status: "inactive", mode: "agent" })
+            }).catch(() => console.warn("Failed to log mic status"));
+
+            await room.localParticipant.unpublishTrack(localTrackRef.current);
+
             if (isMountedRef.current) {
                 setIsRecording(false);
                 setAudioLevel(0);

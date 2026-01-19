@@ -3,6 +3,9 @@ import asyncio
 import json
 import logging
 import signal
+# Windows compat: SIGKILL doesn't exist, map to SIGTERM
+if not hasattr(signal, "SIGKILL"):
+    signal.SIGKILL = signal.SIGTERM
 import threading
 import time
 from dotenv import load_dotenv
@@ -33,6 +36,7 @@ import shutil
 import tempfile
 import io
 from pydub import AudioSegment
+from contextlib import asynccontextmanager
 
 # Load env vars
 load_dotenv()
@@ -56,8 +60,48 @@ if not all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]):
         logger.warning("⚠️ LiveKit credentials missing, but continuing in WebSocket-only mode")
     # Don't exit - WebSocket mode works without LiveKit
 
+# --- Global State & Lifespan ---
+asr_engine = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Startup: Load Model
+    global asr_engine
+    logger.info("⏳ [LIFESPAN] Loading Whisper model...")
+    try:
+        asr_engine = MedicalASR()
+        logger.info("✅ [LIFESPAN] Whisper model ready.")
+    except Exception as e:
+        logger.error(f"❌ [LIFESPAN] Model load failed: {e}")
+
+    # 2. Startup: Launch Agent (Single Loop integration)
+    agent_task = None
+    if LIVEKIT_AVAILABLE and all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]):
+        logger.info("🤖 [LIFESPAN] Starting LiveKit Agent...")
+        # We manually construct the Worker to share the same event loop
+        # This replaces cli.run_app and avoids threading issues
+        worker = agents.Worker(
+            WorkerOptions(entrypoint_fnc=entrypoint),
+            dev_mode=True
+        )
+        agent_task = asyncio.create_task(worker.run())
+
+    yield
+    
+    # 3. Shutdown
+    logger.info("🛑 [LIFESPAN] Shutting down...")
+    if agent_task:
+        logger.info("🛑 [LIFESPAN] Stopping Agent...")
+        # Worker.run() handles its own graceful shutdown signal typically, 
+        # but canceling the task aids prompt exit.
+        agent_task.cancel()
+        try:
+            await agent_task
+        except asyncio.CancelledError:
+            pass
+    
 # --- FastAPI Setup (Token Server) ---
-app = FastAPI(title="LiveKit Voice Agent API")
+app = FastAPI(title="LiveKit Voice Agent API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -95,7 +139,28 @@ async def create_token(req: TokenRequest):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "livekit_available": LIVEKIT_AVAILABLE, "websocket_mode": True}
+    # Robust check: Global engine exists AND model attribute is populated
+    is_whisper_ready = asr_engine is not None and getattr(asr_engine, "model", None) is not None
+    return {
+        "status": "ok", 
+        "livekit_available": LIVEKIT_AVAILABLE, 
+        "websocket_mode": True,
+        "whisper_loaded": is_whisper_ready
+    }
+
+class MicStatus(BaseModel):
+    status: str
+    mode: str
+
+@app.post("/api/status/mic")
+async def log_mic_status(status: MicStatus):
+    """
+    Audit log for microphone usage.
+    """
+    logger.info(f"\n==================================================")
+    logger.info(f"🎤 [PRIVACY AUDIT] {status.mode.upper()} Microphone is now {status.status.upper()}")
+    logger.info(f"==================================================\n")
+    return {"status": "logged"}
 
 # Serve React Frontend (Production)
 from fastapi.staticfiles import StaticFiles
@@ -169,10 +234,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Accumulate bytes
                     session_audio_buffer.extend(audio_bytes)
 
-                    # 🛡️ Truncate Buffer: Keep only last 10s (approx 32KB/s * 10 = 320KB)
-                    # WebM bitrate varies, but safe upper bound 500KB prevents slow loading
-                    if len(session_audio_buffer) > 500 * 1024:
-                         session_audio_buffer = session_audio_buffer[-(500 * 1024):]
+                    # 🛡️ Truncate Buffer: Keep only last 5s (approx 32KB/s * 5 = 160KB)
+                    # Prevents long-running sessions from slowing down pydub parsing
+                    if len(session_audio_buffer) > 160 * 1024:
+                         session_audio_buffer = session_audio_buffer[-(160 * 1024):]
                     
                     # Non-Blocking Processing Logic
                     # If previous task is still running, SKIP inference for this chunk
@@ -193,7 +258,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                 # Use last 5s
                                 if len(audio) > 5000: audio = audio[-5000:]
                                 
-                                if audio.dBFS < -40: return
+                                logger.info(f"[MODE: WEBSOCKET] 🔊 Input Level: {audio.dBFS:.2f} dBFS")
+                                if audio.dBFS < -50: return
                                 
                                 audio = audio.set_channels(1).set_frame_rate(16000)
                                 wav_io = io.BytesIO()
@@ -202,6 +268,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 
                                 # Run Inference
                                 def run_transcription():
+                                    logger.info(f"[AOI] 🧠 Inference started (Using Loaded Model)")
                                     segments, _ = asr_engine.model.transcribe(
                                         wav_io, beam_size=1, language=l, vad_filter=True,
                                         vad_parameters=dict(min_speech_duration_ms=250),
@@ -225,7 +292,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                         await websocket.send_json({
                                             "type": "transcript",
                                             "text": transcribed_text,
-                                            "timestamp": ts,
+                                            "timestamp": int(time.time() * 1000), # Send Absolute Server Epoch
                                             "isFinal": True,
                                             "turnaround_ms": tat,
                                             "id": f"chunk-{int(time.time()*1000)}"
@@ -307,8 +374,15 @@ async def entrypoint(ctx: 'JobContext'):
     """
     Main LiveKit Agent Entrypoint.
     """
-    logger.info(f"[AGENT MODE] 🚀 Agent assigned to room: {ctx.room.name}")
-    await ctx.connect()
+    try:
+        # Give the event loop a breath to prevent AssignmentTimeoutError on busy Windows threads
+        await asyncio.sleep(0.1)
+        
+        logger.info(f"[AGENT MODE] 🚀 Agent assigned to room: {ctx.room.name}")
+        await ctx.connect()
+    except Exception as e:
+        logger.error(f"[AGENT MODE] 💥 Connection/Assignment failed: {e}")
+        return
     logger.info(f"[AGENT MODE] ✅ Connected. Participants: {len(ctx.room.remote_participants)}")
     
     # Store settings per participant (e.g. language)
@@ -330,7 +404,10 @@ async def entrypoint(ctx: 'JobContext'):
                     participant_configs[identity] = {"language": lang}
                     logger.info(f"[AGENT MODE] ⚙️ Language set to '{lang}' for {identity}")
             except Exception as e:
-                logger.error(f"[AGENT MODE] Error processing config: {e}")
+                if "shutdown" in str(e).lower():
+                     pass # Agent is stopping, ignore
+                else:
+                    logger.error(f"[AGENT MODE] Error processing config: {e}")
 
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track, publication, participant):
@@ -381,127 +458,101 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
     
     # Transcription loop
     frame_count = 0
-    async for event in audio_stream:
-        # event is an AudioFrameEvent
-        frame = event.frame
-        audio_buffer.extend(frame.data.tobytes())
-        
-        frame_count += 1
-        if frame_count % 500 == 0:
-            logger.info(f"[AGENT MODE] 📊 Audio stream active (Participant: {participant.identity})")
-        
-        # If buffer is full enough, process it
-        if len(audio_buffer) >= BUFFER_SIZE_BYTES:
-            # 1. Extract and clear buffer always
-            audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
-            audio_buffer.clear()
+    try:
+        async for event in audio_stream:
+            await asyncio.sleep(0) # Yield to allow cancellation
             
-            # Check Peak Volume
-            peak = np.abs(audio_np).max()
+            # event is an AudioFrameEvent
+            frame = event.frame
+            audio_buffer.extend(frame.data.tobytes())
             
-            # Skip AI processing if it's mostly silence (Increased to 0.04 to block background hum)
-            if peak < 0.04:
-                continue
-
-            logger.info(f"[AGENT MODE] 🔊 Sound detected (Peak: {peak:.4f})")
+            frame_count += 1
+            if frame_count % 500 == 0:
+                logger.info(f"[AGENT MODE] 📊 Audio stream active (Participant: {participant.identity})")
             
-            # 2. Transcribe in executor
-            process_start = time.time()
-            try:
-                def do_transcribe(data, lang):
-                    # ALL heavy lifting must stay in executor
-                    segments, _ = asr_engine.model.transcribe(
-                        data, 
-                        beam_size=1, 
-                        language=lang, 
-                        vad_filter=True,
-                        # Ignore sounds shorter than 250ms (keyboard clicks, bumps)
-                        vad_parameters=dict(min_speech_duration_ms=250),
-                        # If Whisper is < 60% sure it's speech, ignore it
-                        no_speech_threshold=0.6
-                    )
-                    text = " ".join([seg.text for seg in segments]).strip()
-                    return asr_engine.filter_hallucinations(text)
-
-                loop = asyncio.get_running_loop()
-                # Get current language from configs
-                current_lang = participant_configs.get(participant.identity, {}).get("language", "en")
-                full_transcription = await loop.run_in_executor(None, do_transcribe, audio_np, current_lang)
+            # If buffer is full enough, process it
+            if len(audio_buffer) >= BUFFER_SIZE_BYTES:
+                # 1. Extract and clear buffer always
+                audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+                audio_buffer.clear()
                 
-                if full_transcription:
-                    process_end = time.time()
-                    turnaround_ms = int((process_end - process_start) * 1000)
+                # Check Peak Volume
+                peak = np.abs(audio_np).max()
+                
+                # Debug Audio Levels for observability
+                if peak > 0.005: 
+                     logger.info(f"[AGENT MODE] 🔊 Input Level: {peak:.4f}")
 
-                    # Boxed log for high visibility
-                    text_len = len(full_transcription)
-                    logger.info(f"[MODE: LIVEKIT-AGENT] 🗣️  Detected Speech (Lang: {current_lang}) TAT: {turnaround_ms}ms")
-                    logger.info(f"\n╔{'═' * (text_len + 4)}╗\n║  {full_transcription}  ║\n╚{'═' * (text_len + 4)}╝\n")
+                # Skip AI processing if it's mostly silence (Lowered to 0.01 to ensure capture)
+                if peak < 0.01:
+                    continue
+
+                logger.info(f"[AGENT MODE] 🔊 Sound detected (Peak: {peak:.4f})")
+                
+                # 2. Transcribe in executor
+                process_start = time.time()
+                try:
+                    def do_transcribe(data, lang):
+                        # ALL heavy lifting must stay in executor
+                        segments, _ = asr_engine.model.transcribe(
+                            data, 
+                            beam_size=1, 
+                            language=lang, 
+                            vad_filter=True,
+                            # Ignore sounds shorter than 250ms (keyboard clicks, bumps)
+                            vad_parameters=dict(min_speech_duration_ms=250),
+                            # If Whisper is < 60% sure it's speech, ignore it
+                            no_speech_threshold=0.6
+                        )
+                        text = " ".join([seg.text for seg in segments]).strip()
+                        return asr_engine.filter_hallucinations(text)
+
+                    loop = asyncio.get_running_loop()
+                    # Get current language from configs
+                    current_lang = participant_configs.get(participant.identity, {}).get("language", "en")
+                    full_transcription = await loop.run_in_executor(None, do_transcribe, audio_np, current_lang)
                     
-                    payload = json.dumps({
-                        "type": "transcript",
-                        "text": full_transcription,
-                        "isFinal": True,
-                        "timestamp": int(time.time() * 1000),
-                        "participantId": participant.identity,
-                        "turnaround_ms": turnaround_ms
-                    })
-                    
-                    await ctx.room.local_participant.publish_data(
-                        payload, 
-                        reliable=True,
-                        topic="transcription"
-                    )
-                elif peak > 0.05:
-                    # Log if there was significant sound but no words detected
-                    logger.info(f"[AGENT MODE] 🔇 No speech found (Peak Volume: {peak:.4f})")
-            
-            except Exception as e:
-                logger.error(f"[AGENT MODE] ASR Execution failed: {e}")
+                    if full_transcription:
+                        process_end = time.time()
+                        turnaround_ms = int((process_end - process_start) * 1000)
+
+                        # Boxed log for high visibility
+                        text_len = len(full_transcription)
+                        logger.info(f"[MODE: LIVEKIT-AGENT] 🗣️  Detected Speech (Lang: {current_lang}) TAT: {turnaround_ms}ms")
+                        logger.info(f"\n╔{'═' * (text_len + 4)}╗\n║  {full_transcription}  ║\n╚{'═' * (text_len + 4)}╝\n")
+                        
+                        payload = json.dumps({
+                            "type": "transcript",
+                            "text": full_transcription,
+                            "isFinal": True,
+                            "timestamp": int(time.time() * 1000),
+                            "participantId": participant.identity,
+                            "turnaround_ms": turnaround_ms
+                        })
+                        
+                        await ctx.room.local_participant.publish_data(
+                            payload, 
+                            reliable=True,
+                            topic="transcription"
+                        )
+                    elif peak > 0.05:
+                        # Log if there was significant sound but no words detected
+                        logger.info(f"[AGENT MODE] 🔇 No speech found (Peak Volume: {peak:.4f})")
+                
+                except Exception as e:
+                    if "shutdown" in str(e).lower():
+                         pass # Agent is stopping, ignore
+                    else:
+                        logger.error(f"[AGENT MODE] ASR Execution failed: {e}")
+
+    except asyncio.CancelledError:
+        logger.info(f"[AGENT MODE] 🛑 Audio processing task cancelled for {participant.identity}")
+        return # Exit cleanly
 
 
 # --- Main Application Runner ---
 
-def run_fastapi():
-    config = uvicorn.Config(app, host="0.0.0.0", port=API_PORT, loop="asyncio")
-    server = uvicorn.Server(config)
-    asyncio.run(server.serve())
-
-def run_worker():
-    # Start FastAPI in background thread
-    t = threading.Thread(target=run_fastapi, daemon=True)
-    t.start()
-    
-    if LIVEKIT_AVAILABLE:
-        # Run Agent
-        cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
-    else:
-        # Just keep alive for WebSocket server
-        logger.info("✅ WebSocket server running. LiveKit Agent disabled.")
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
-
 if __name__ == "__main__":
-    # Check credentials to decide mode
-    has_creds = all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET])
-    should_run_agent = LIVEKIT_AVAILABLE and has_creds
-
-    mode = "Hybrid (LiveKit + WebSocket)" if should_run_agent else "WebSocket-Only"
-    print(f"🚀 Starting {mode} Server (API on {API_PORT})...")
-    
-    if should_run_agent:
-        # Run with LiveKit Agent
-        t = threading.Thread(target=run_fastapi, daemon=True)
-        t.start()
-        
-        import sys
-        if len(sys.argv) == 1:
-            sys.argv.append("dev")
-            
-        cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
-    else:
-        # WebSocket-only mode
-        print("✅ LiveKit disabled. Running WebSocket server for transcription.")
-        run_fastapi()
+    print(f"🚀 Starting Unified Server (API + Agent on Port {API_PORT})...")
+    # Single Process, Single Loop, Maximum Stability
+    uvicorn.run(app, host="0.0.0.0", port=API_PORT)

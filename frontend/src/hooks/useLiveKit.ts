@@ -124,7 +124,7 @@ export function useLiveKit(): UseLiveKitReturn {
           if (!isActiveRef.current) return;
           analyser.getByteFrequencyData(dataArray);
           const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-          setAudioLevel(average / 255);
+          setAudioLevel(Math.min(1, average / 128));
           requestAnimationFrame(updateLevel);
         };
 
@@ -169,7 +169,7 @@ export function useLiveKit(): UseLiveKitReturn {
 
               const segment: TranscriptSegment = {
                 id: data.id || crypto.randomUUID(),
-                timestamp: data.timestamp || Date.now() - sessionStartRef.current,
+                timestamp: data.timestamp ? (data.timestamp - sessionStartRef.current) : (Date.now() - sessionStartRef.current),
                 text: data.text,
                 confidence: data.confidence,
                 speaker: data.speaker,
@@ -257,6 +257,13 @@ export function useLiveKit(): UseLiveKitReturn {
     }
 
     try {
+      // Notify Backend (Privacy Audit)
+      fetch("/api/status/mic", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "active", mode: "hybrid" })
+      }).catch(() => console.warn("Failed to log mic status"));
+
       const mediaStream = new MediaStream([audioTrackRef.current.mediaStreamTrack]);
 
       const mediaRecorder = new MediaRecorder(mediaStream, {
@@ -268,6 +275,7 @@ export function useLiveKit(): UseLiveKitReturn {
         if (event.data.size > 0 && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           const arrayBuffer = await event.data.arrayBuffer();
           const bytes = new Uint8Array(arrayBuffer);
+          console.log(`[Hybrid] 📤 Sent audio chunk: ${event.data.size} bytes`);
           const binary = Array.from(bytes).map(b => String.fromCharCode(b)).join('');
           const base64 = btoa(binary);
           wsRef.current.send(JSON.stringify({
@@ -276,7 +284,6 @@ export function useLiveKit(): UseLiveKitReturn {
             timestamp: Date.now() - sessionStartRef.current,
             language: languageRef.current
           }));
-          console.log(`[Hybrid] 📤 Sent audio chunk: ${event.data.size} bytes`);
         }
       };
 
@@ -302,6 +309,13 @@ export function useLiveKit(): UseLiveKitReturn {
 
   // Stop recording (just pause, keep connection alive)
   const stopRecording = useCallback(() => {
+    // Notify Backend (Privacy Audit)
+    fetch("/api/status/mic", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "inactive", mode: "hybrid" })
+    }).catch(() => console.warn("Failed to log mic status"));
+
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
       mediaRecorderRef.current = null;

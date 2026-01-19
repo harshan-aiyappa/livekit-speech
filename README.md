@@ -44,6 +44,11 @@ Vocalis is a high-performance speech recognition practice platform designed for 
 - **Secure Access:** Built-in support for **Ngrok** tunneling to test on mobile devices securely over HTTPS.
 - **Touch-Friendly:** Large controls, haptic-style feedback, and visualizers.
 
+### 🛡️ Privacy & Security
+- **Strict Mute/Unmute:** Microphones are initialized in "Standby" (Muted) mode. Hardware is active for instant readiness, but **zero audio data** is transmitted until you press Record.
+- **Privacy Audit:** Every microphone activation (`active`) and deactivation (`inactive`) is cryptographically logged to the backend (`/api/status/mic`) for a strictly auditable timeline.
+- **HTTPS Enforcement:** Mobile access requires secure context (HTTPS/WSS).
+
 ---
 
 ## 🛠️ Architecture
