@@ -81,8 +81,12 @@ async def lifespan(app: FastAPI):
         # We manually construct the Worker to share the same event loop
         # This replaces cli.run_app and avoids threading issues
         worker = agents.Worker(
-            WorkerOptions(entrypoint_fnc=entrypoint),
-            dev_mode=True
+            WorkerOptions(
+                entrypoint_fnc=entrypoint,
+                ws_url=LIVEKIT_URL,
+                api_key=LIVEKIT_API_KEY,
+                api_secret=LIVEKIT_API_SECRET
+            )
         )
         agent_task = asyncio.create_task(worker.run())
 
@@ -451,99 +455,72 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
     # Configuration
     SAMPLE_RATE = 16000
     BYTES_PER_SAMPLE = 2 # int16
-    BUFFER_SECONDS = 1.0 # Reduced from 1.5s to 1.0s for faster TAT (Tradeoff: Context)
+    BUFFER_SECONDS = 0.6 # Reduced from 1.0s to 0.6s for near-realtime TAT
     BUFFER_SIZE_BYTES = int(SAMPLE_RATE * BYTES_PER_SAMPLE * BUFFER_SECONDS)
     
     logger.info(f"[MODE: LIVEKIT-AGENT] 🎧 Started processing audio for {participant.identity}")
     
-    # Transcription loop
+    # helper for non-blocking processing
+    async def process_step(audio_data, lang_code):
+        check_peak = np.abs(audio_data).max()
+        if check_peak < 0.01: return 
+
+        process_start = time.time()
+        loop = asyncio.get_running_loop()
+        
+        def do_transcribe(data, lang):
+            segments, _ = asr_engine.model.transcribe(
+                 data, beam_size=1, language=lang, vad_filter=True,
+                 vad_parameters=dict(min_speech_duration_ms=250),
+                 no_speech_threshold=0.6
+            )
+            text = " ".join([seg.text for seg in segments]).strip()
+            return asr_engine.filter_hallucinations(text)
+
+        try:
+            full_transcription = await loop.run_in_executor(None, do_transcribe, audio_data, lang_code)
+            if full_transcription:
+                turnaround_ms = int((time.time() - process_start) * 1000)
+                logger.info(f"[AGENT MODE] 📤 Sent to UI: '{full_transcription}'")
+                
+                payload = json.dumps({
+                    "type": "transcript",
+                    "text": full_transcription,
+                    "isFinal": True,
+                    "participantId": participant.identity,
+                    "timestamp": int(time.time() * 1000),
+                    "turnaround_ms": turnaround_ms
+                })
+                await ctx.room.local_participant.publish_data(payload, topic="transcription", reliable=True)
+        except Exception as e:
+            logger.error(f"[AGENT MODE] Task failed: {e}")
+
+    # Main Loop
+    processing_task = None
     frame_count = 0
     try:
         async for event in audio_stream:
-            await asyncio.sleep(0) # Yield to allow cancellation
-            
-            # event is an AudioFrameEvent
-            frame = event.frame
-            audio_buffer.extend(frame.data.tobytes())
+            await asyncio.sleep(0)
+            audio_buffer.extend(event.frame.data.tobytes())
             
             frame_count += 1
             if frame_count % 500 == 0:
-                logger.info(f"[AGENT MODE] 📊 Audio stream active (Participant: {participant.identity})")
-            
-            # If buffer is full enough, process it
+                 logger.info(f"[AGENT] Stream active...")
+
+            # Dynamic Batching
             if len(audio_buffer) >= BUFFER_SIZE_BYTES:
-                # 1. Extract and clear buffer always
+                # If busy, keep buffering (don't overwrite/skip, just accumulate context!)
+                if processing_task and not processing_task.done():
+                    continue 
+                
+                # Ready to process
                 audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
                 audio_buffer.clear()
                 
-                # Check Peak Volume
-                peak = np.abs(audio_np).max()
-                
-                # Debug Audio Levels for observability
-                if peak > 0.005: 
-                     logger.info(f"[AGENT MODE] 🔊 Input Level: {peak:.4f}")
+                # Launch background task
+                current_lang = participant_configs.get(participant.identity, {}).get("language", "en")
+                processing_task = asyncio.create_task(process_step(audio_np, current_lang))
 
-                # Skip AI processing if it's mostly silence (Lowered to 0.01 to ensure capture)
-                if peak < 0.01:
-                    continue
-
-                logger.info(f"[AGENT MODE] 🔊 Sound detected (Peak: {peak:.4f})")
-                
-                # 2. Transcribe in executor
-                process_start = time.time()
-                try:
-                    def do_transcribe(data, lang):
-                        # ALL heavy lifting must stay in executor
-                        segments, _ = asr_engine.model.transcribe(
-                            data, 
-                            beam_size=1, 
-                            language=lang, 
-                            vad_filter=True,
-                            # Ignore sounds shorter than 250ms (keyboard clicks, bumps)
-                            vad_parameters=dict(min_speech_duration_ms=250),
-                            # If Whisper is < 60% sure it's speech, ignore it
-                            no_speech_threshold=0.6
-                        )
-                        text = " ".join([seg.text for seg in segments]).strip()
-                        return asr_engine.filter_hallucinations(text)
-
-                    loop = asyncio.get_running_loop()
-                    # Get current language from configs
-                    current_lang = participant_configs.get(participant.identity, {}).get("language", "en")
-                    full_transcription = await loop.run_in_executor(None, do_transcribe, audio_np, current_lang)
-                    
-                    if full_transcription:
-                        process_end = time.time()
-                        turnaround_ms = int((process_end - process_start) * 1000)
-
-                        # Boxed log for high visibility
-                        text_len = len(full_transcription)
-                        logger.info(f"[MODE: LIVEKIT-AGENT] 🗣️  Detected Speech (Lang: {current_lang}) TAT: {turnaround_ms}ms")
-                        logger.info(f"\n╔{'═' * (text_len + 4)}╗\n║  {full_transcription}  ║\n╚{'═' * (text_len + 4)}╝\n")
-                        
-                        payload = json.dumps({
-                            "type": "transcript",
-                            "text": full_transcription,
-                            "isFinal": True,
-                            "timestamp": int(time.time() * 1000),
-                            "participantId": participant.identity,
-                            "turnaround_ms": turnaround_ms
-                        })
-                        
-                        await ctx.room.local_participant.publish_data(
-                            payload, 
-                            reliable=True,
-                            topic="transcription"
-                        )
-                    elif peak > 0.05:
-                        # Log if there was significant sound but no words detected
-                        logger.info(f"[AGENT MODE] 🔇 No speech found (Peak Volume: {peak:.4f})")
-                
-                except Exception as e:
-                    if "shutdown" in str(e).lower():
-                         pass # Agent is stopping, ignore
-                    else:
-                        logger.error(f"[AGENT MODE] ASR Execution failed: {e}")
 
     except asyncio.CancelledError:
         logger.info(f"[AGENT MODE] 🛑 Audio processing task cancelled for {participant.identity}")

@@ -113,6 +113,12 @@ export function useLiveKitAgent() {
         return () => {
             room.off(RoomEvent.DataReceived, handleData);
             room.off(RoomEvent.Disconnected, handleDisconnect);
+            // Ensure connection is closed on unmount
+            room.disconnect();
+            if (localTrackRef.current) {
+                localTrackRef.current.stop();
+                localTrackRef.current = null;
+            }
         };
     }, [room]);
 
