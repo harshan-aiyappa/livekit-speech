@@ -69,7 +69,7 @@ export function useLiveKit(): UseLiveKitReturn {
           participant_name: `User-${Math.floor(Math.random() * 1000)}`,
         });
         const tokenResponse = await response.json();
-        const { token } = tokenResponse;
+        const { token, livekit_url } = tokenResponse;
 
         if (!mounted) return;
         setRoomName(newRoomName);
@@ -89,8 +89,16 @@ export function useLiveKit(): UseLiveKitReturn {
           console.log("LiveKit connection state:", state);
         });
 
-        const wsUrl = import.meta.env.VITE_LIVEKIT_URL || "wss://kimo-zg71lj4i.livekit.cloud";
-        await liveKitRoom.connect(wsUrl, token);
+        let wsUrl = livekit_url || import.meta.env.VITE_LIVEKIT_URL || "wss://kimo-zg71lj4i.livekit.cloud";
+        // Force WSS/WS for LiveKit signal
+        wsUrl = wsUrl.replace("https://", "wss://").replace("http://", "ws://");
+
+        console.log("🔗 Connecting to LiveKit at:", wsUrl);
+
+        // Connect to the room with specific URL
+        await liveKitRoom.connect(wsUrl, token, {
+          autoSubscribe: true,
+        });
         console.log("✅ LiveKit room connected (persistent)");
 
         // Get microphone permission and create audio track
@@ -158,8 +166,6 @@ export function useLiveKit(): UseLiveKitReturn {
             }
 
             if (data.type === "transcript" && data.text) {
-              console.log("Transcript received:", data);
-
               // Calculate latency
               if (data.timestamp) {
                 const nowRelative = Date.now() - sessionStartRef.current;

@@ -195,9 +195,13 @@ export function useLiveKitAgent() {
             if (!data.token) throw new Error("No token received");
             if (!isMountedRef.current) return; // EXIT if unmounted
 
-            console.log("[Agent] Signal URL:", data.livekit_url);
+            let signalUrl = data.livekit_url || "wss://kimo-zg71lj4i.livekit.cloud";
+            // Force WSS/WS for LiveKit signal
+            signalUrl = signalUrl.replace("https://", "wss://").replace("http://", "ws://");
+
+            console.log("[Agent] Signal URL:", signalUrl);
             // Connect to Room
-            await room.connect(data.livekit_url, data.token);
+            await room.connect(signalUrl, data.token);
             console.log("[Agent] ✅ Room connected:", uniqueRoomName);
 
             if (!isMountedRef.current) { room.disconnect(); return; }
