@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI):
         worker = agents.Worker(
             WorkerOptions(
                 entrypoint_fnc=entrypoint,
+                agent_name="MedicalTranscriptionAgent",
                 ws_url=LIVEKIT_URL,
                 api_key=LIVEKIT_API_KEY,
                 api_secret=LIVEKIT_API_SECRET
@@ -472,22 +473,29 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
     # helper for non-blocking processing
     async def process_step(audio_data, lang_code):
         check_peak = np.abs(audio_data).max()
-        if check_peak < 0.01: return 
+        # Debugging: Log every analysis attempt to trace "missing" audio
+        logger.info(f"[AGENT] 🔍 Analysing audio chunk (Peak: {check_peak:.4f})")
+        
+        if check_peak < 0.005: return 
 
         process_start = time.time()
         loop = asyncio.get_running_loop()
         
         def do_transcribe(data, lang):
             segments, _ = asr_engine.model.transcribe(
-                 data, beam_size=1, language=lang, vad_filter=True,
-                 vad_parameters=dict(min_speech_duration_ms=250),
-                 no_speech_threshold=0.6
+                 data, beam_size=1, language=lang, 
+                 # Disable VAD to prevent hanging on silence
+                 vad_filter=False
             )
             text = " ".join([seg.text for seg in segments]).strip()
             return asr_engine.filter_hallucinations(text)
 
         try:
-            full_transcription = await loop.run_in_executor(None, do_transcribe, audio_data, lang_code)
+            # SAFETY: Timeout after 2.0s to prevent blocking future audio
+            full_transcription = await asyncio.wait_for(
+                loop.run_in_executor(None, do_transcribe, audio_data, lang_code), 
+                timeout=2.0
+            )
             if full_transcription:
                 turnaround_ms = int((time.time() - process_start) * 1000)
                 payload = json.dumps({
