@@ -338,14 +338,18 @@ class MedicalASR:
     Manages the faster-whisper model and VAD for transcription
     """
     def __init__(self):
-        logger.info("⏳ Loading Whisper (small) model...")
-        # Run on CPU with int8 quantization for speed/compatibility
-        # Upgraded to 'small' for better accuracy (vs base)
+        # Allow configuration via Env (e.g. 'medium' for Server, 'tiny' for fast CPU)
+        model_size = os.getenv("MODEL_SIZE", "small")
+        device = os.getenv("WHISPER_DEVICE", "cpu")
+        compute_type = os.getenv("WHISPER_COMPUTE", "int8")
+
+        logger.info(f"⏳ Loading Whisper ({model_size}) model on {device}...")
         try:
-            self.model = WhisperModel("small", device="cpu", compute_type="int8")
-        except:
-             logger.warning("⚠️ Failed to load 'small' model, falling back to 'base'")
-             self.model = WhisperModel("base", device="cpu", compute_type="int8")
+            self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load '{model_size}' model: {e}")
+            logger.warning("⚠️ Falling back to 'base' (CPU/int8)")
+            self.model = WhisperModel("base", device="cpu", compute_type="int8")
              
         logger.info(f"✅ Whisper model loaded.")
         
