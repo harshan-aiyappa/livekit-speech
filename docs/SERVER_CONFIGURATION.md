@@ -1,76 +1,53 @@
-# 🎛️ Server Deployment Guide (Whisper Configuration)
-### For Office Server / GPU Deployment
+# 🎛️ System Configuration Guide
+### Switching between Harshan's PC and Office Server
 
-Your Application supports dynamic configuration of the AI Model. This allows you to use powerful models (like `large-v3`) on your office server while using smaller models (`tiny`) on laptops.
+The application is designed to be highly portable. You can switch between low-power local development and high-power server deployment by simply toggling blocks in your `backend/.env` file.
 
 ---
 
-## 1. Environment Variables
-Add these to your `.env` file on the server (or user deployment config):
+## 1. System Presets
+
+### **Preset A: Harshan's PC (Local Development)**
+*   **Use Case:** Debugging, UI changes, quick testing.
+*   **Hardware:** Laptop CPU.
+*   **Model:** `small` or `tiny`.
+*   **Logic:** Uses Cloud LiveKit for easy mobile testing.
+
+### **Preset B: Office Server (Production / Xeon Gold)**
+*   **Target Hardware:** Dell Precision 7820 Tower.
+*   **Processor:** Intel Xeon Gold 6130 (16 Cores / 32 Threads) | 128GB RAM.
+*   **Advantage:** Supports **AVX-512** instructions. With 128GB RAM, you can run the `large-v3` model with peak performance and zero memory pressure.
+*   **Model:** `large-v3` (Highest accuracy).
+*   **Logic:** Uses Local or Private LiveKit Instance for maximum privacy.
+
+---
+
+## 2. Hardware Comparison
+
+| Hardware           | Preset Name       | Model Size | Device | Intel Optimization         |
+| :----------------- | :---------------- | :--------- | :----- | :------------------------- |
+| **Xeon Gold 6130** | **Office Server** | `large-v3` | `cpu`  | ✅ **AVX-512** (Powerhouse) |
+| **i7 / Ryzen 7**   | **Harshan's PC**  | `small`    | `cpu`  | ✅ AVX2                     |
+| **Old Laptop**     | **Emergency**     | `tiny`     | `cpu`  | ⚠️ SSE4                     |
+
+---
+
+## 3. How to Switch
+1.  Open `backend/.env`.
+2.  Comment out the old block using `#`.
+3.  Uncomment the new block.
+4.  Restart the backend: `python main.py`.
+
+---
+
+## 4. Verification Logs
+Check your terminal output on startup:
 
 ```bash
-# 🧠 Model Size
-# Options: tiny, base, small, medium, large-v3
-# Recommended for Server: medium or large-v3
-MODEL_SIZE=medium
-
-# ⚡ Hardware Acceleration
-# Options: cpu, cuda (NVIDIA GPU)
-# Recommended for Server: cuda 
-WHISPER_DEVICE=cuda
-
-# 🧮 Precision
-# Options: int8, float16 (best for GPU), int8_float16
-# Recommended for GPU: float16
-WHISPER_COMPUTE=float16
-```
-
----
-
-## 2. Hardware Recommendations
-
-| Scenario                          | Env Config                                     | Required Hardware                             | Performance                              |
-| :-------------------------------- | :--------------------------------------------- | :-------------------------------------------- | :--------------------------------------- |
-| **High Accuracy (Office Server)** | `MODEL_SIZE=large-v3`<br>`WHISPER_DEVICE=cuda` | NVIDIA GPU (RTX 3060 / A10 / T4)<br>8GB+ VRAM | 🚀 **Ultra-Accurate**<br>Real-time (50ms) |
-| **Balanced (Strong CPU)**         | `MODEL_SIZE=medium`<br>`WHISPER_DEVICE=cpu`    | i7 or Ryzen 7<br>16GB RAM                     | ⚡ **Good**<br>~1s latency                |
-| **Fastest (Development)**         | `MODEL_SIZE=tiny`<br>`WHISPER_DEVICE=cpu`      | Any Modern Laptop                             | 🏎️ **Instant**<br>Lower accuracy          |
-
----
-
-## 4. LiveKit Server Configuration
-You can switch between the **Cloud/Office** LiveKit server and a **Local** LiveKit server by updating the credentials in your `.env` file.
-
-### **Cloud / Office Server (Remote)**
-Use this for team collaboration or mobile testing via Ngrok.
-```bash
-LIVEKIT_URL=wss://your-office-server.livekit.cloud
-LIVEKIT_API_KEY=your_key
-LIVEKIT_API_SECRET=your_secret
-```
-
-### **Local Server (Offline)**
-Use this for private development without internet.
-1.  **Run LiveKit locally** (using Docker):
-    ```bash
-    docker run --rm -p 7880:7880 -p 7881:7881 -p 7882:7882/udp livekit/livekit server --dev
-    ```
-2.  **Update `.env`**:
-    ```bash
-    LIVEKIT_URL=ws://localhost:7880
-    LIVEKIT_API_KEY=devkey
-    LIVEKIT_API_SECRET=secret
-    ```
-
----
-
-## 5. How to Verify
-When you start the backend, check the initialization logs:
-
-```text
-INFO:asr-worker:⏳ Loading Whisper (medium) model on cuda...
+# Success: Office Server Mode
+INFO:asr-worker:⏳ Loading Whisper (large-v3) model on cuda...
 INFO:asr-worker:🤖 [LIFESPAN] Starting LiveKit Agent...
-INFO:livekit.agents:starting worker
-INFO:livekit.agents:registered worker
-```
 
-If the agent fails to connect, verify your `LIVEKIT_URL` matches your server's address.
+# Success: Harshan's PC Mode
+INFO:asr-worker:⏳ Loading Whisper (small) model on cpu...
+```
