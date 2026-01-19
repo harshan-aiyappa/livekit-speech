@@ -8,7 +8,15 @@ if not hasattr(signal, "SIGKILL"):
     signal.SIGKILL = signal.SIGTERM
 import threading
 import time
+import io
+import base64
 from dotenv import load_dotenv
+
+# --- Server/Path Configuration ---
+# Force FFmpeg path for Dell Server & Local environments
+FFMPEG_PATH = r"C:\ffmpeg\ffmpeg-2026-01-14-git-6c878f8b82-full_build\bin"
+if os.path.exists(FFMPEG_PATH):
+    os.environ["PATH"] += os.pathsep + FFMPEG_PATH
 
 # LiveKit & Signal Processing  
 try:
@@ -224,41 +232,40 @@ async def websocket_endpoint(websocket: WebSocket):
         asr_engine = MedicalASR()
     
     # Buffer to accumulate WebM chunks (must keep the header at the start)
+    header_buffer = bytearray()
     session_audio_buffer = bytearray()
-    last_process_time = time.time()
-    processing_task = None # Track async inference status
+    processing_task = None 
     
     # Send status to client
     await websocket.send_json({
         "type": "status",
         "whisper_ready": True,
         "mode": "live"
-    })
-    
+    })    
     try:
         while True:
             data = await websocket.receive_json()
             
             if data.get("type") == "audio_chunk":
                 try:
-                    # process_start = time.time() # Moved inside task
                     audio_base64 = data.get("data", "")
                     audio_bytes = base64.b64decode(audio_base64)
+                    
+                    # Capture header on first chunk
+                    if not header_buffer:
+                        header_buffer = audio_bytes[:4096] # Capture first 4KB (WebM Header)
                     
                     # Accumulate bytes
                     session_audio_buffer.extend(audio_bytes)
 
-                    # 🛡️ Truncate Buffer: Keep only last 5s (approx 32KB/s * 5 = 160KB)
-                    # Prevents long-running sessions from slowing down pydub parsing
-                    if len(session_audio_buffer) > 160 * 1024:
-                         session_audio_buffer = session_audio_buffer[-(160 * 1024):]
+                    # 🛡️ Truncate Buffer: Keep only last 8s
+                    # We prepend the header to the tail so decoders still work
+                    if len(session_audio_buffer) > 256 * 1024:
+                         session_audio_buffer = session_audio_buffer[-(256 * 1024):]
                     
-                    # Non-Blocking Processing Logic
-                    # If previous task is still running, SKIP inference for this chunk
-                    # This prevents the "60s latency spiral"
                     if processing_task is None or processing_task.done():
-                        # Clone buffer for the task
-                        buffer_copy =  session_audio_buffer[:] 
+                        # Construct a valid WebM snippet by prepending the original header
+                        buffer_copy = header_buffer + session_audio_buffer
                         lang = data.get("language", "en")
                         timestamp = data.get("timestamp", 0)
                         
@@ -343,15 +350,15 @@ class MedicalASR:
         device = os.getenv("WHISPER_DEVICE", "cpu")
         compute_type = os.getenv("WHISPER_COMPUTE", "int8")
 
-        logger.info(f"⏳ Loading Whisper ({model_size}) model on {device}...")
+        logger.info(f"Loading Whisper ({model_size}) model on {device}...")
         try:
             self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
         except Exception as e:
-            logger.warning(f"⚠️ Failed to load '{model_size}' model: {e}")
-            logger.warning("⚠️ Falling back to 'base' (CPU/int8)")
+            logger.warning(f"Failed to load '{model_size}' model: {e}")
+            logger.warning("Falling back to 'base' (CPU/int8)")
             self.model = WhisperModel("base", device="cpu", compute_type="int8")
              
-        logger.info(f"✅ Whisper model loaded.")
+        logger.info(f"Whisper model loaded.")
         
         # Hallucination Blocklist (Common subtitle artifacts)
         self.HALLUCINATIONS = {
@@ -449,11 +456,12 @@ async def entrypoint(ctx: 'JobContext'):
 
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant):
-        logger.info(f"[AGENT MODE] 👤 Participant joined: {participant.identity}")
+        logger.info(f"[AGENT MODE] Participant joined: {participant.identity}")
 
     # Wait for the job to close
-    # ctx.wait_for_shutdown() is handled by the worker framework usually, 
-    # but we can keep the coroutine alive if needed.
+    # CRITICAL: Without this, the coroutine returns and the job terminates immediately!
+    await ctx.wait_for_shutdown()
+    logger.info(f"[AGENT MODE] Agent job closing for room {ctx.room.name}")
 
 async def process_audio_track(ctx: 'JobContext', track, participant, participant_configs):
     """
@@ -495,10 +503,10 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
             return asr_engine.filter_hallucinations(text)
 
         try:
-            # SAFETY: Timeout after 2.0s to prevent blocking future audio
+            # SAFETY: Timeout after 5.0s (Models can take time to warm up)
             full_transcription = await asyncio.wait_for(
                 loop.run_in_executor(None, do_transcribe, audio_data, lang_code), 
-                timeout=2.0
+                timeout=5.0
             )
             if full_transcription:
                 turnaround_ms = int((time.time() - process_start) * 1000)
@@ -530,12 +538,14 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
 
             # Dynamic Batching
             if len(audio_buffer) >= BUFFER_SIZE_BYTES:
-                # If busy, keep buffering (don't overwrite/skip, just accumulate context!)
+                # If busy, keep buffering (don't clear, just accumulate context!)
                 if processing_task and not processing_task.done():
                     continue 
                 
-                # Ready to process
+                # Ready to process - Move data to numpy
                 audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+                
+                # CLEAR logic: We clear the buffer because we've converted it to audio_np
                 audio_buffer.clear()
                 
                 # Launch background task
@@ -551,6 +561,6 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
 # --- Main Application Runner ---
 
 if __name__ == "__main__":
-    print(f"🚀 Starting Unified Server (API + Agent on Port {API_PORT})...")
+    print(f"Starting Unified Server (API + Agent on Port {API_PORT})...")
     # Single Process, Single Loop, Maximum Stability
     uvicorn.run(app, host="0.0.0.0", port=API_PORT)
