@@ -75,43 +75,23 @@ asr_engine = None
 async def lifespan(app: FastAPI):
     # 1. Startup: Load Model
     global asr_engine
-    logger.info("⏳ [LIFESPAN] Loading Whisper model...")
-    try:
-        asr_engine = MedicalASR()
-        logger.info("✅ [LIFESPAN] Whisper model ready.")
-    except Exception as e:
-        logger.error(f"❌ [LIFESPAN] Model load failed: {e}")
+    if asr_engine is None:
+        logger.info("[LIFESPAN] Loading Whisper model...")
+        try:
+            asr_engine = MedicalASR()
+            logger.info("[LIFESPAN] Whisper model ready.")
+        except Exception as e:
+            logger.error(f"[LIFESPAN] Model load failed: {e}")
 
-    # 2. Startup: Launch Agent (Single Loop integration)
-    agent_task = None
-    if LIVEKIT_AVAILABLE and all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]):
-        logger.info("🤖 [LIFESPAN] Starting LiveKit Agent...")
-        # We manually construct the Worker to share the same event loop
-        # This replaces cli.run_app and avoids threading issues
-        worker = agents.Worker(
-            WorkerOptions(
-                entrypoint_fnc=entrypoint,
-                agent_name="MedicalTranscriptionAgent",
-                ws_url=LIVEKIT_URL,
-                api_key=LIVEKIT_API_KEY,
-                api_secret=LIVEKIT_API_SECRET
-            )
-        )
-        agent_task = asyncio.create_task(worker.run())
+    # 2. Startup: Launch Agent Background Task Handler
+    # We no longer use agents.Worker(run) because custom LiveKit instances
+    # often lack the Job Manager. We join rooms directly.
+    logger.info("[LIFESPAN] Ready to spawn agents on-demand.")
 
     yield
     
     # 3. Shutdown
-    logger.info("🛑 [LIFESPAN] Shutting down...")
-    if agent_task:
-        logger.info("🛑 [LIFESPAN] Stopping Agent...")
-        # Worker.run() handles its own graceful shutdown signal typically, 
-        # but canceling the task aids prompt exit.
-        agent_task.cancel()
-        try:
-            await agent_task
-        except asyncio.CancelledError:
-            pass
+    logger.info("[LIFESPAN] Shutting down...")
     
 # --- FastAPI Setup (Token Server) ---
 app = FastAPI(title="LiveKit Voice Agent API", lifespan=lifespan)
@@ -145,6 +125,11 @@ async def create_token(req: TokenRequest):
             can_subscribe=True
         ))
     
+    # --- TRIGGER AGENT (Manual Spawn) ---
+    if req.room_name.startswith("agent-"):
+        logger.info(f"Triggering Agent for room: {req.room_name}")
+        asyncio.create_task(spawn_agent(req.room_name))
+
     return {
         "token": token.to_jwt(),
         "livekit_url": LIVEKIT_URL
@@ -392,33 +377,33 @@ class MedicalASR:
         full_text = " ".join([s.text for s in segments]).strip()
         return full_text
 
-# Global ASR instance initialized on startup
-asr_engine = MedicalASR()
+# Global ASR instance is initialized in the lifespan
+# asr_engine = MedicalASR()
 
-async def entrypoint(ctx: 'JobContext'):
+async def spawn_agent(room_name: str):
     """
-    Main LiveKit Agent Entrypoint.
+    Directly joins a room as a participant to act as an agent.
+    This bypasses the LiveKit Job system for guaranteed connection.
     """
-    try:
-        # Give the event loop a breath to prevent AssignmentTimeoutError on busy Windows threads
-        await asyncio.sleep(0.1)
-        
-        logger.info(f"[AGENT MODE] 🚀 Agent assigned to room: {ctx.room.name}")
-        await ctx.connect()
-    except Exception as e:
-        logger.error(f"[AGENT MODE] 💥 Connection/Assignment failed: {e}")
-        return
-    logger.info(f"[AGENT MODE] ✅ Connected. Participants: {len(ctx.room.remote_participants)}")
+    room = rtc.Room()
     
+    @room.on("track_subscribed")
+    def on_track_subscribed(track, publication, participant):
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+             if participant.identity == "Agent-AI": return
+             logger.info(f"[AGENT] Processing audio track {track.sid} from {participant.identity}")
+             asyncio.create_task(process_audio_track(room, track, participant, participant_configs))
+
+    @room.on("track_published")
+    def on_track_published(publication, participant):
+        if publication.kind == rtc.TrackKind.KIND_AUDIO:
+            if participant.identity == "Agent-AI": return
+            publication.set_subscribed(True)
+
     # Store settings per participant (e.g. language)
     participant_configs = {}
 
-    def handle_track(track, participant):
-        if track.kind == rtc.TrackKind.KIND_AUDIO:
-            logger.info(f"[AGENT MODE] 🎤 Processing audio track {track.sid} from {participant.identity}")
-            asyncio.create_task(process_audio_track(ctx, track, participant, participant_configs))
-
-    @ctx.room.on("data_received")
+    @room.on("data_received")
     def on_data_received(data: rtc.DataPacket):
         if data.topic == "config":
             try:
@@ -427,43 +412,41 @@ async def entrypoint(ctx: 'JobContext'):
                     identity = data.participant.identity
                     lang = msg.get("language", "en")
                     participant_configs[identity] = {"language": lang}
-                    logger.info(f"[AGENT MODE] ⚙️ Language set to '{lang}' for {identity}")
+                    logger.info(f"[AGENT] Language set to '{lang}' for {identity}")
             except Exception as e:
-                if "shutdown" in str(e).lower():
-                     pass # Agent is stopping, ignore
-                else:
-                    logger.error(f"[AGENT MODE] Error processing config: {e}")
+                logger.error(f"[AGENT] Error processing config: {e}")
 
-    @ctx.room.on("track_subscribed")
-    def on_track_subscribed(track, publication, participant):
-        handle_track(track, participant)
-
-    @ctx.room.on("track_published")
-    def on_track_published(publication, participant):
-        if publication.kind == rtc.TrackKind.KIND_AUDIO:
-            logger.info(f"[AGENT MODE] 📡 New track published: {publication.sid}. Subscribing...")
-            publication.set_subscribed(True)
-
-    # Scavenge for existing tracks (in case user joined before agent)
-    for participant in ctx.room.remote_participants.values():
-        for publication in participant.track_publications.values():
-            if publication.kind == rtc.TrackKind.KIND_AUDIO:
-                if publication.track:
-                    handle_track(publication.track, participant)
-                else:
-                    logger.info(f"[AGENT MODE] 🔍 Auto-subscribing to existing track {publication.sid}")
+    try:
+        # Generate Agent Token
+        token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
+            .with_identity("Agent-AI") \
+            .with_name("Transcription Agent") \
+            .with_grants(api.VideoGrants(room_join=True, room=room_name, can_subscribe=True, can_publish=True)) \
+            .to_jwt()
+            
+        await room.connect(LIVEKIT_URL, token)
+        logger.info(f"[AGENT] Successfully joined room: {room_name}")
+        
+        # Subscribe to existing tracks
+        for participant in room.remote_participants.values():
+            if participant.identity == "Agent-AI": continue # Don't subscribe to self
+            for publication in participant.track_publications.values():
+                if publication.kind == rtc.TrackKind.KIND_AUDIO:
                     publication.set_subscribed(True)
 
-    @ctx.room.on("participant_connected")
-    def on_participant_connected(participant):
-        logger.info(f"[AGENT MODE] Participant joined: {participant.identity}")
+        # KEEP ALIVE LOOP: Stay in room as long as there is at least one remote participant
+        # (Wait 10s initially to allow user to connect)
+        await asyncio.sleep(10)
+        while len(room.remote_participants) > 0:
+            await asyncio.sleep(5)
+            
+        logger.info(f"[AGENT] Participant left, cleaning up room: {room_name}")
+        await room.disconnect()
 
-    # Wait for the job to close
-    # CRITICAL: Without this, the coroutine returns and the job terminates immediately!
-    await ctx.wait_for_shutdown()
-    logger.info(f"[AGENT MODE] Agent job closing for room {ctx.room.name}")
+    except Exception as e:
+        logger.error(f"[AGENT] Room {room_name} error: {e}")
 
-async def process_audio_track(ctx: 'JobContext', track, participant, participant_configs):
+async def process_audio_track(room: rtc.Room, track, participant, participant_configs):
     """
     Reads audio frames from the track, buffers them, and runs ASR.
     """
@@ -488,7 +471,7 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
         # Debugging: Log every analysis attempt to trace "missing" audio
         logger.info(f"[AGENT] 🔍 Analysing audio chunk (Peak: {check_peak:.4f})")
         
-        if check_peak < 0.005: return 
+        if check_peak < 0.001: return # Increased sensitivity
 
         process_start = time.time()
         loop = asyncio.get_running_loop()
@@ -518,7 +501,7 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
                     "timestamp": int(time.time() * 1000),
                     "turnaround_ms": turnaround_ms
                 })
-                await ctx.room.local_participant.publish_data(payload, topic="transcription", reliable=True)
+                await room.local_participant.publish_data(payload, topic="transcription", reliable=True)
                 
                 logger.info(f"[AGENT MODE] 📤 Sent to UI: '{full_transcription}'")
         except Exception as e:
@@ -533,8 +516,8 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
             audio_buffer.extend(event.frame.data.tobytes())
             
             frame_count += 1
-            if frame_count % 500 == 0:
-                 logger.info(f"[AGENT] Stream active...")
+            if frame_count % 2000 == 0:
+                 logger.info(f"[AGENT] Audio session active for {participant.identity}...")
 
             # Dynamic Batching
             if len(audio_buffer) >= BUFFER_SIZE_BYTES:
