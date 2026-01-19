@@ -40,9 +40,19 @@ export function useLiveKitAgent() {
     // Cleanup on unmount - Ensure everything is killed
     useEffect(() => {
         isMountedRef.current = true;
+        const startTime = Date.now(); // Track Session Start
+
         return () => {
             isMountedRef.current = false;
             console.log("[Agent] 🧹 Unmounting component - cleanup started");
+
+            // Log Duration
+            const duration = (Date.now() - startTime) / 1000;
+            fetch("/api/status/mic", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ status: "disconnected", mode: "agent_mode", duration })
+            }).catch(() => { });
 
             // 1. Mark connecting as false to abort pending operations
             isConnectingRef.current = false;
@@ -225,6 +235,13 @@ export function useLiveKitAgent() {
             if (isMountedRef.current) {
                 setStatus("connected");
                 setError(null);
+
+                // Analytics: Track Mode Entry
+                fetch("/api/status/mic", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ status: "connected", mode: "agent_mode_joined" })
+                }).catch(() => { });
             }
 
         } catch (err: any) {

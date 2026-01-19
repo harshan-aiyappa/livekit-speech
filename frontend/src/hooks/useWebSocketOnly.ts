@@ -213,10 +213,19 @@ export function useWebSocketOnly() {
     // Cleanup
     useEffect(() => {
         isMountedRef.current = true;
+        const startTime = Date.now();
         connect();
         return () => {
             isMountedRef.current = false;
             console.log("[Direct] 🧹 Cleaning up...");
+
+            // Log Duration
+            const duration = (Date.now() - startTime) / 1000;
+            fetch("/api/status/mic", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ status: "disconnected", mode: "websocket_mode", duration })
+            }).catch(() => { });
 
             // Close Socket
             socketRef.current?.close();

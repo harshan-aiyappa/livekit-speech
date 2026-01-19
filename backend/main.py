@@ -155,15 +155,24 @@ async def health():
 class MicStatus(BaseModel):
     status: str
     mode: str
+    duration: float = 0.0
 
 @app.post("/api/status/mic")
 async def log_mic_status(status: MicStatus):
     """
-    Audit log for microphone usage.
+    Audit log for microphone usage and User Journey Tracking.
     """
-    logger.info(f"\n==================================================")
-    logger.info(f"🎤 [PRIVACY AUDIT] {status.mode.upper()} Microphone is now {status.status.upper()}")
-    logger.info(f"==================================================\n")
+    if "joined" in status.mode:
+         # Mode Entry Event
+         logger.info(f"👤 [USER TRACKING] User ENTERED mode: {status.mode.replace('_joined', '').upper()}")
+    elif status.duration > 0:
+         # Session Duration Event
+         logger.info(f"⏱️ [SESSION STATS] User spent {status.duration:.2f}s in {status.mode.upper()}")
+    else:
+         # Mic Toggle Event
+         logger.info(f"\n==================================================")
+         logger.info(f"🎤 [PRIVACY AUDIT] {status.mode.upper()} Microphone is now {status.status.upper()}")
+         logger.info(f"==================================================\n")
     return {"status": "logged"}
 
 # Serve React Frontend (Production)
@@ -481,8 +490,6 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
             full_transcription = await loop.run_in_executor(None, do_transcribe, audio_data, lang_code)
             if full_transcription:
                 turnaround_ms = int((time.time() - process_start) * 1000)
-                logger.info(f"[AGENT MODE] 📤 Sent to UI: '{full_transcription}'")
-                
                 payload = json.dumps({
                     "type": "transcript",
                     "text": full_transcription,
@@ -492,6 +499,8 @@ async def process_audio_track(ctx: 'JobContext', track, participant, participant
                     "turnaround_ms": turnaround_ms
                 })
                 await ctx.room.local_participant.publish_data(payload, topic="transcription", reliable=True)
+                
+                logger.info(f"[AGENT MODE] 📤 Sent to UI: '{full_transcription}'")
         except Exception as e:
             logger.error(f"[AGENT MODE] Task failed: {e}")
 
