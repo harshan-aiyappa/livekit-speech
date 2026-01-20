@@ -3,20 +3,24 @@ import asyncio
 import json
 import logging
 import signal
-# Windows compat: SIGKILL doesn't exist, map to SIGTERM
-if not hasattr(signal, "SIGKILL"):
-    signal.SIGKILL = signal.SIGTERM
 import threading
 import time
 import io
 import base64
+import numpy as np
+import shutil
+import tempfile
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
-# --- Server/Path Configuration ---
-# Force FFmpeg path for Dell Server & Local environments
-FFMPEG_PATH = r"C:\ffmpeg\ffmpeg-2026-01-14-git-6c878f8b82-full_build\bin"
-if os.path.exists(FFMPEG_PATH):
-    os.environ["PATH"] += os.pathsep + FFMPEG_PATH
+# Web Server & Utilities
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+import uvicorn
+from pydub import AudioSegment
 
 # LiveKit & Signal Processing  
 try:
@@ -29,22 +33,8 @@ except Exception as e:
     print("⚠️ Running in WebSocket-ONLY mode (Recommended for single-user apps)")
     LIVEKIT_AVAILABLE = False
 
-import numpy as np
-
 # ASR
 from faster_whisper import WhisperModel
-
-# Web Server
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
-import base64
-import shutil
-import tempfile
-import io
-from pydub import AudioSegment
-from contextlib import asynccontextmanager
 
 # Load env vars
 load_dotenv()
@@ -70,10 +60,21 @@ if not all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]):
 
 # --- Global State & Lifespan ---
 asr_engine = None
+asr_executor = threading.Thread(target=lambda: None) # Placeholder
+from concurrent.futures import ThreadPoolExecutor
+# Dedicated pool for CPU-bound inference
+inference_executor = ThreadPoolExecutor(max_workers=1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Startup: Load Model
+    # 1. Startup: Verify FFmpeg
+    if not shutil.which("ffmpeg"):
+        logger.error("❌ FFmpeg not found in PATH. Audio processing will fail.")
+        # We don't exit, but we warn heavily
+    else:
+        logger.info("✅ FFmpeg verified in system PATH.")
+
+    # 2. Startup: Load Model
     global asr_engine
     if asr_engine is None:
         logger.info("[LIFESPAN] Loading Whisper model...")
@@ -240,78 +241,83 @@ async def websocket_endpoint(websocket: WebSocket):
                     if not header_buffer:
                         header_buffer = audio_bytes[:4096] # Capture first 4KB (WebM Header)
                     
-                    # Accumulate bytes
+                    # 🔄 Accumulate bytes (Full stream to ensure valid decoding)
                     session_audio_buffer.extend(audio_bytes)
-
-                    # 🛡️ Truncate Buffer: Keep only last 8s
-                    # We prepend the header to the tail so decoders still work
-                    if len(session_audio_buffer) > 256 * 1024:
-                         session_audio_buffer = session_audio_buffer[-(256 * 1024):]
                     
                     if processing_task is None or processing_task.done():
-                        # Construct a valid WebM snippet by prepending the original header
-                        buffer_copy = header_buffer + session_audio_buffer
-                        lang = data.get("language", "en")
-                        timestamp = data.get("timestamp", 0)
+                        # Construct a valid WebM snippet by prepending EVERYTHING since start
+                        # WebM decoding of partial streams is fragile; full stream is safer.
+                        buffer_copy = bytes(session_audio_buffer)
+                        lang = data.get("language", language_ref.current if 'language_ref' in locals() else "en")
                         
-                        async def task_wrapper(buf, l, ts):
+                        async def task_wrapper(buf, l):
                             loop = asyncio.get_running_loop()
                             t_start = time.time()
                             
                             try:
                                 # Prepare WAV in memory
                                 audio = AudioSegment.from_file(io.BytesIO(buf), format="webm")
-                                # Use last 5s
+                                
+                                # 🛡️ LIMIT TO LAST 5s FOR SPEED
                                 if len(audio) > 5000: audio = audio[-5000:]
                                 
                                 logger.info(f"[MODE: WEBSOCKET] 🔊 Input Level: {audio.dBFS:.2f} dBFS")
-                                if audio.dBFS < -50: return
+                                if audio.dBFS < -65: return # More sensitive (-50 -> -65)
                                 
                                 audio = audio.set_channels(1).set_frame_rate(16000)
                                 wav_io = io.BytesIO()
                                 audio.export(wav_io, format="wav")
                                 wav_io.seek(0)
                                 
-                                # Run Inference
+                                # Run Inference with Timeout and dedicated pool
                                 def run_transcription():
-                                    logger.info(f"[AOI] 🧠 Inference started (Using Loaded Model)")
+                                    logger.info(f"[AOI] 🧠 Inference started for WebSocket...")
                                     segments, _ = asr_engine.model.transcribe(
                                         wav_io, beam_size=1, language=l, vad_filter=True,
-                                        vad_parameters=dict(min_speech_duration_ms=250),
+                                        vad_parameters=dict(min_speech_duration_ms=150), # High responsiveness
                                         no_speech_threshold=0.6
                                     )
-                                    text = " ".join([s.text for s in segments]).strip()
-                                    return asr_engine.filter_hallucinations(text)
+                                    raw_text = " ".join([s.text for s in segments]).strip()
+                                    if raw_text:
+                                        logger.info(f"[MODE: WEBSOCKET] 👂 Whisper heard: '{raw_text}'")
+                                    return asr_engine.filter_hallucinations(raw_text)
                                 
                                 try:
-                                    transcribed_text = await loop.run_in_executor(None, run_transcription)
-                                except RuntimeError as e:
-                                    if "shutdown" in str(e).lower():
-                                        return  # Silently ignore shutdown errors
-                                    raise
-                                
+                                    # Removed timeout as requested - let it run until finished
+                                    # transcribed_text = await asyncio.wait_for(
+                                    #     loop.run_in_executor(inference_executor, run_transcription),
+                                    #     timeout=15.0
+                                    # )
+                                    transcribed_text = await loop.run_in_executor(inference_executor, run_transcription)
+                                except Exception as e:
+                                    logger.error(f"[MODE: WEBSOCKET] ❌ Inference failed: {e}")
+                                    return
+
                                 if transcribed_text:
                                     t_end = time.time()
                                     tat = int((t_end - t_start) * 1000)
-                                    logger.info(f"[MODE: WEBSOCKET] 📤 Transcript: '{transcribed_text}' ({tat}ms)")
+                                    logger.info(f"[MODE: WEBSOCKET] 📤 Final Transcript: '{transcribed_text}' ({tat}ms)")
                                     try:
                                         await websocket.send_json({
                                             "type": "transcript",
                                             "text": transcribed_text,
-                                            "timestamp": int(time.time() * 1000), # Send Absolute Server Epoch
+                                            "timestamp": int(time.time() * 1000), 
                                             "isFinal": True,
                                             "turnaround_ms": tat,
                                             "id": f"chunk-{int(time.time()*1000)}"
                                         })
                                     except:
-                                        pass # Socket might be closed
+                                        pass
+                                else:
+                                    if transcribed_text == "":
+                                         logger.info("[MODE: WEBSOCKET] 🔕 Filtered/Empty result (No speech detected)")
                             except RuntimeError as e:
                                 if "shutdown" not in str(e).lower():
                                     logger.error(f"Task Error: {e}")
                             except Exception as e:
                                 logger.error(f"Task Error: {e}")
 
-                        processing_task = asyncio.create_task(task_wrapper(buffer_copy, lang, timestamp))
+                        processing_task = asyncio.create_task(task_wrapper(buffer_copy, lang))
 
                 except Exception as e:
                     logger.error(f"❌ Error processing audio chunk: {e}")
@@ -354,10 +360,15 @@ class MedicalASR:
     
     def filter_hallucinations(self, text: str) -> str:
         if not text: return ""
-        if text.strip() in self.HALLUCINATIONS:
-            return ""
-        # If text starts with "Thank you" and is very short, ignore
-        if text.strip().startswith("Thank you") and len(text) < 15:
+        cleaned = text.strip().lower()
+        
+        # Exact match check (case-insensitive)
+        for h in self.HALLUCINATIONS:
+            if cleaned == h.lower():
+                return ""
+        
+        # Prefix check (case-insensitive) for "Thank you" artifacts
+        if cleaned.startswith("thank you") and len(cleaned) < 15:
             return ""
         return text
         
@@ -478,19 +489,23 @@ async def process_audio_track(room: rtc.Room, track, participant, participant_co
         
         def do_transcribe(data, lang):
             segments, _ = asr_engine.model.transcribe(
-                 data, beam_size=1, language=lang, 
-                 # Disable VAD to prevent hanging on silence
-                 vad_filter=False
+                data, beam_size=1, language=lang, vad_filter=True,
+                vad_parameters=dict(min_speech_duration_ms=150),
+                no_speech_threshold=0.6
             )
-            text = " ".join([seg.text for seg in segments]).strip()
-            return asr_engine.filter_hallucinations(text)
+            raw_text = " ".join([s.text for s in segments]).strip()
+            if raw_text:
+                logger.info(f"[AGENT MODE] 👂 Whisper heard: '{raw_text}'")
+            return asr_engine.filter_hallucinations(raw_text)
 
         try:
-            # SAFETY: Timeout after 5.0s (Models can take time to warm up)
-            full_transcription = await asyncio.wait_for(
-                loop.run_in_executor(None, do_transcribe, audio_data, lang_code), 
-                timeout=5.0
-            )
+            # Removed timeout as requested - let it run until finished
+            # full_transcription = await asyncio.wait_for(
+            #     loop.run_in_executor(inference_executor, do_transcribe, audio_data, lang_code), 
+            #     timeout=15.0
+            # )
+            full_transcription = await loop.run_in_executor(inference_executor, do_transcribe, audio_data, lang_code)
+            
             if full_transcription:
                 turnaround_ms = int((time.time() - process_start) * 1000)
                 payload = json.dumps({
@@ -503,9 +518,15 @@ async def process_audio_track(room: rtc.Room, track, participant, participant_co
                 })
                 await room.local_participant.publish_data(payload, topic="transcription", reliable=True)
                 
-                logger.info(f"[AGENT MODE] 📤 Sent to UI: '{full_transcription}'")
+                logger.info(f"[AGENT MODE] 📤 Sent to UI: '{full_transcription}' ({turnaround_ms}ms)")
+            else:
+                logger.info("[AGENT MODE] 🔕 Filtered/Empty result")
+        except asyncio.TimeoutError:
+            logger.warning(f"[AGENT MODE] ⏳ Transcription timed out after 15s (Model too slow for CPU?)")
         except Exception as e:
-            logger.error(f"[AGENT MODE] Task failed: {e}")
+            logger.error(f"[AGENT MODE] ❌ Task failed: {type(e).__name__} - {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     # Main Loop
     processing_task = None
@@ -521,14 +542,19 @@ async def process_audio_track(room: rtc.Room, track, participant, participant_co
 
             # Dynamic Batching
             if len(audio_buffer) >= BUFFER_SIZE_BYTES:
-                # If busy, keep buffering (don't clear, just accumulate context!)
+                # If busy, keep buffering (don't clear!)
                 if processing_task and not processing_task.done():
+                    # Cap buffer to 10s of audio to prevent runaway memory
+                    if len(audio_buffer) > SAMPLE_RATE * BYTES_PER_SAMPLE * 10:
+                        audio_buffer = audio_buffer[-(SAMPLE_RATE * BYTES_PER_SAMPLE * 10):]
                     continue 
                 
                 # Ready to process - Move data to numpy
+                # TAKE ALL DATA we have accumulated while busy (up to 30s)
+                # This ensures we don't lose speech that happened while transcribing.
                 audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
                 
-                # CLEAR logic: We clear the buffer because we've converted it to audio_np
+                # CLEAR logic: We clear because we are about to process EVERYTHING in audio_np
                 audio_buffer.clear()
                 
                 # Launch background task
