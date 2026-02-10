@@ -34,56 +34,17 @@ export function useWebSocketOnly() {
     const WS_URL = `${protocol}//${window.location.host}/ws`;
 
     const connect = useCallback(async () => {
+        if (socketRef.current && socketRef.current.readyState !== WebSocket.CLOSED) return;
+
         try {
             if (isMountedRef.current) setStatus("connecting");
             const ws = new WebSocket(WS_URL);
+            socketRef.current = ws;
 
             ws.onopen = async () => {
                 if (isMountedRef.current) {
                     setStatus("connected");
                     toast({ title: "Connected", description: "Direct WebSocket connection established." });
-
-                    // -------------------------------------------------------
-                    // MICROPHONE SETUP: Init & Mute (Standby)
-                    // -------------------------------------------------------
-                    if (!streamRef.current) {
-                        try {
-                            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-                            if (!isMountedRef.current) {
-                                stream.getTracks().forEach(t => t.stop());
-                                return;
-                            }
-
-                            // 1. Mic Active for Visualizer (Data Gated via MediaRecorder)
-                            streamRef.current = stream;
-                            console.log("[Direct] Mic initialized (Active / Standby)");
-
-                            // 2. Setup Visualizer (Input is silent when disabled)
-                            const audioContext = new AudioContext();
-                            const source = audioContext.createMediaStreamSource(stream);
-                            const analyzer = audioContext.createAnalyser();
-                            analyzer.fftSize = 256;
-                            source.connect(analyzer);
-                            analyzerRef.current = analyzer;
-
-                            const updateLevel = () => {
-                                if (!isMountedRef.current) return;
-                                const dataArray = new Uint8Array(analyzer.frequencyBinCount);
-                                analyzer.getByteFrequencyData(dataArray);
-                                const avg = dataArray.reduce((p, c) => p + c, 0) / dataArray.length;
-                                setAudioLevel(Math.min(1, avg / 128));
-                                animationFrameRef.current = requestAnimationFrame(updateLevel);
-                            };
-                            updateLevel();
-
-                        } catch (e) {
-                            console.error("[Direct] Failed to get mic:", e);
-                            toast({ title: "Mic Error", description: "Could not access microphone.", variant: "destructive" });
-                        }
-                    }
-                } else {
-                    ws.close();
                 }
             };
 
@@ -91,11 +52,8 @@ export function useWebSocketOnly() {
                 if (!isMountedRef.current) return;
                 try {
                     const data = JSON.parse(event.data);
-
-                    if (data.type === "status") {
-                        if (data.whisper_ready) {
-                            setIsModelReady(true);
-                        }
+                    if (data.type === "status" && data.whisper_ready) {
+                        setIsModelReady(true);
                     }
 
                     if (data.type === "transcript" && data.text) {
@@ -115,7 +73,7 @@ export function useWebSocketOnly() {
                         setSegments(prev => [...prev, segment]);
                     }
                 } catch (e) {
-                    console.error("Parse error", e);
+                    console.error("[Direct] Parse error", e);
                 }
             };
 
@@ -124,29 +82,55 @@ export function useWebSocketOnly() {
             };
 
             ws.onerror = (e) => {
-                console.error("WS Error", e);
+                console.error("[Direct] WS Error", e);
                 if (isMountedRef.current) setStatus("error");
             };
 
-            socketRef.current = ws;
-
         } catch (e) {
+            console.error("[Direct] Connection failed", e);
             if (isMountedRef.current) setStatus("error");
         }
-    }, [toast, WS_URL]);
+    }, [WS_URL, toast]);
 
     const startRecording = useCallback(async () => {
-        if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
-            toast({ title: "Not Connected", description: "Waiting for server connection...", variant: "destructive" });
-            return;
-        }
-
-        if (!streamRef.current) {
-            toast({ title: "Not Ready", description: "Microphone initializing...", variant: "destructive" });
-            return;
-        }
-
         try {
+            // 1. Ensure WS Connected
+            if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
+                await connect();
+                let attempts = 0;
+                while ((!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) && attempts < 10) {
+                    await new Promise(r => setTimeout(r, 500));
+                    attempts++;
+                }
+                if (socketRef.current?.readyState !== WebSocket.OPEN) throw new Error("Server connection timed out");
+            }
+
+            // 2. Init Mic On-Demand (Privacy)
+            if (!streamRef.current) {
+                console.log("[Direct] 🎙️ Initializing hardware...");
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                streamRef.current = stream;
+
+                // Setup Visualizer
+                const audioContext = new AudioContext();
+                const source = audioContext.createMediaStreamSource(stream);
+                const analyzer = audioContext.createAnalyser();
+                analyzer.fftSize = 256;
+                source.connect(analyzer);
+                analyzerRef.current = analyzer;
+
+                const updateLevel = () => {
+                    if (!isMountedRef.current || !streamRef.current) return;
+                    const dataArray = new Uint8Array(analyzer.frequencyBinCount);
+                    analyzer.getByteFrequencyData(dataArray);
+                    const avg = dataArray.reduce((p, c) => p + c, 0) / dataArray.length;
+                    setAudioLevel(Math.min(1, avg / 128));
+                    animationFrameRef.current = requestAnimationFrame(updateLevel);
+                };
+                updateLevel();
+                console.log("[Direct] ✅ Mic hardware active");
+            }
+
             console.log("[Direct] 🚀 Starting capture...");
             sessionStartRef.current = Date.now();
 
@@ -157,8 +141,6 @@ export function useWebSocketOnly() {
                 body: JSON.stringify({ status: "active", mode: "websocket" })
             }).catch(() => { });
 
-            // 1. Start Recorder
-            // Note: MediaRecorder might need to be re-created if stopped
             const recorder = new MediaRecorder(streamRef.current, { mimeType: "audio/webm;codecs=opus" });
             mediaRecorderRef.current = recorder;
 
@@ -173,24 +155,23 @@ export function useWebSocketOnly() {
                             timestamp: Date.now(),
                             language: languageRef.current
                         }));
-                        console.log(`[Direct] 📤 Sent audio chunk: ${event.data.size} bytes`);
                     };
                     reader.readAsDataURL(event.data);
                 }
             };
 
-            recorder.start(500); // 500ms chunks
+            recorder.start(500);
             setIsRecording(true);
             setLatency(0);
 
-        } catch (e) {
-            console.error("Mic Error", e);
-            toast({ title: "Error", description: "Failed to start recording.", variant: "destructive" });
+        } catch (err: any) {
+            console.error("[Direct] Start error:", err);
+            toast({ title: "Error", description: err.message || "Failed to start recording.", variant: "destructive" });
         }
-    }, [toast]);
+    }, [connect, toast]);
 
     const stopRecording = useCallback(() => {
-        console.log("[Direct] ⏸️ Stopping capture...");
+        console.log("[Direct] 🛑 Total shutdown and hardware release...");
 
         // Notify Backend
         fetch("/api/status/mic", {
@@ -199,52 +180,40 @@ export function useWebSocketOnly() {
             body: JSON.stringify({ status: "inactive", mode: "websocket" })
         }).catch(() => { });
 
-        // Stop Recorder (Stop sending chunks)
         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
             mediaRecorderRef.current.stop();
+            mediaRecorderRef.current = null;
         }
 
-        if (isMountedRef.current) {
-            setIsRecording(false);
-            setAudioLevel(0);
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(t => t.stop());
+            streamRef.current = null;
         }
+
+        if (socketRef.current) {
+            socketRef.current.close();
+            socketRef.current = null;
+        }
+
+        if (animationFrameRef.current) {
+            cancelAnimationFrame(animationFrameRef.current);
+            animationFrameRef.current = undefined;
+        }
+
+        setIsRecording(false);
+        setStatus("idle");
+        setAudioLevel(0);
     }, []);
 
     // Cleanup
     useEffect(() => {
         isMountedRef.current = true;
-        const startTime = Date.now();
-        connect();
+        // Don't auto-connect here anymore to favor explicit connection
         return () => {
             isMountedRef.current = false;
-            console.log("[Direct] 🧹 Cleaning up...");
-
-            // Log Duration
-            const duration = (Date.now() - startTime) / 1000;
-            fetch("/api/status/mic", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ status: "disconnected", mode: "websocket_mode", duration })
-            }).catch(() => { });
-
-            // Close Socket
-            socketRef.current?.close();
-
-            // Stop Recorder
-            if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-                mediaRecorderRef.current.stop();
-            }
-
-            // FULL STOP Microphone (Release Hardware)
-            if (streamRef.current) {
-                streamRef.current.getTracks().forEach(t => t.stop());
-                streamRef.current = null;
-                console.log("[Direct] 🛑 Microphone hardware released");
-            }
-
-            if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+            stopRecording();
         };
-    }, [connect]);
+    }, [stopRecording]);
 
     return {
         status,

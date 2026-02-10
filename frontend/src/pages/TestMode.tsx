@@ -24,6 +24,7 @@ export default function TestMode() {
     isRecording,
     segments,
     audioLevel,
+    connect,
     startRecording,
     stopRecording,
     roomName,
@@ -42,10 +43,15 @@ export default function TestMode() {
   const [isModalOpen, setIsModalOpen] = useState(true);
   const [micStatus, setMicStatus] = useState<"idle" | "running" | "success" | "error">("idle");
 
-  const { data: healthData, isError: healthError, isLoading: healthLoading } = useQuery<{ status: string; timestamp: string; whisper_loaded: boolean }>({
+  const { data: healthData, isError: healthError, isLoading: healthLoading } = useQuery<{ status: string; timestamp: string; whisper_loaded: boolean; backend?: string }>({
     queryKey: ["/api/health"],
     refetchInterval: 10000,
   });
+
+  // Auto-connect on mount for System Check
+  useEffect(() => {
+    connect();
+  }, [connect]);
 
   useEffect(() => {
     if (status === "connected") {

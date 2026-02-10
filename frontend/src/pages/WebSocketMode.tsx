@@ -36,6 +36,11 @@ export default function WebSocketMode() {
     const [isModalOpen, setIsModalOpen] = useState(true);
     const [micStatus, setMicStatus] = useState<"idle" | "running" | "success" | "error">("idle");
 
+    // Auto-connect on mount for System Check
+    useEffect(() => {
+        connect();
+    }, [connect]);
+
     // Check Mic Permission on Mount
     useEffect(() => {
         if (isModalOpen && micStatus === "idle") {

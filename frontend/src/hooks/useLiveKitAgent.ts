@@ -260,23 +260,53 @@ export function useLiveKitAgent() {
         }
     }, [room, toast]);
 
-    // 2. Start Recording = Publish Track
+    // Start recording (Connect -> Init Mic -> Publish)
     const startRecording = useCallback(async () => {
-        if (!localTrackRef.current) return;
         try {
+            // 1. Ensure Connected
+            if (room.state !== ConnectionState.Connected) {
+                console.log("[Agent] 🔄 Not connected, connecting before start...");
+                await connect();
+                let attempts = 0;
+                while (room.state !== ConnectionState.Connected && attempts < 10) {
+                    await new Promise(r => setTimeout(r, 500));
+                    attempts++;
+                }
+                if (room.state !== ConnectionState.Connected) throw new Error("Connection failed");
+            }
+
+            // 2. Init Mic On-Demand (Privacy)
+            if (!localTrackRef.current) {
+                console.log("[Agent] 🎙️ Creating mic track (Hardware Activation)...");
+                const track = await createLocalAudioTrack({
+                    noiseSuppression: true,
+                    echoCancellation: true,
+                    autoGainControl: true,
+                });
+
+                if (!isMountedRef.current) {
+                    track.stop();
+                    return;
+                }
+
+                localTrackRef.current = track;
+                setIsTrackReady(true); // Trigger visualizer effect
+                console.log("[Agent] ✅ Mic hardware active");
+            }
+
             console.log("[Agent] 🚀 Starting capture (Publishing)...");
 
-            // Notify Backend (Privacy Audit)
+            // Notify Backend
             fetch("/api/status/mic", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ status: "active", mode: "agent" })
-            }).catch(() => console.warn("Failed to log mic status"));
+            }).catch(() => { });
 
             sessionStartRef.current = Date.now();
             await room.localParticipant.publishTrack(localTrackRef.current);
 
-            // Send config again to ensure agent has correct language
+            // Send config to ensure agent has correct language
             const configPayload = JSON.stringify({ type: "config", language });
             await room.localParticipant.publishData(
                 new TextEncoder().encode(configPayload),
@@ -286,34 +316,51 @@ export function useLiveKitAgent() {
             if (isMountedRef.current) setIsRecording(true);
             console.log("[Agent] 🎤 Capture active (Language:", language, ")");
         } catch (err: any) {
-            console.error("[Agent] Failed to publish:", err);
-            if (isMountedRef.current) toast({ title: "Mic Error", description: "Could not activate microphone", variant: "destructive" });
+            console.error("[Agent] Failed to start:", err);
+            if (isMountedRef.current) {
+                toast({ title: "Mic Error", description: err.message || "Could not activate microphone", variant: "destructive" });
+                setIsRecording(false);
+            }
         }
-    }, [toast, language, room]);
+    }, [toast, language, room, connect]);
 
-    // 3. Stop Recording = Unpublish Track
+    // Stop recording (Total Destruction)
     const stopRecording = useCallback(async () => {
-        if (!localTrackRef.current) return;
         try {
-            console.log("[Agent] ⏸️ Stopping capture (Unpublishing)...");
+            console.log("[Agent] 🏁 Stopping session and destroying room...");
 
-            // Notify Backend (Privacy Audit)
+            // Notify Backend
             fetch("/api/status/mic", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ status: "inactive", mode: "agent" })
-            }).catch(() => console.warn("Failed to log mic status"));
+            }).catch(() => { });
 
-            await room.localParticipant.unpublishTrack(localTrackRef.current);
+            // 1. Unpublish & Stop Hardware
+            if (localTrackRef.current) {
+                try {
+                    await room.localParticipant.unpublishTrack(localTrackRef.current);
+                } catch (e) { }
+                localTrackRef.current.stop();
+                localTrackRef.current = null;
+                setIsTrackReady(false);
+            }
+
+            // 2. Disconnect Room
+            if (room.state !== ConnectionState.Disconnected) {
+                room.disconnect();
+            }
 
             if (isMountedRef.current) {
                 setIsRecording(false);
+                setStatus("idle");
                 setAudioLevel(0);
             }
+            console.log("[Agent] ✅ Room destroyed and mic hardware released");
         } catch (err) {
-            console.error("[Agent] Failed to mute:", err);
+            console.error("[Agent] Failed to stop/destroy:", err);
         }
-    }, []);
+    }, [room]);
 
 
     return {
